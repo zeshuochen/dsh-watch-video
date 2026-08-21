@@ -1,0 +1,7 @@
+- insert:
+    - id: dsh-video-understand
+      name: dsh-video-understand
+      config:
+        outputDir: "${DSH_HOME}/video-understand/jobs"
+        device: cuda
+        computeType: int8_float16
