@@ -1,4 +1,29 @@
-import argparse,json
-p=argparse.ArgumentParser();p.add_argument('--audio',required=True);p.add_argument('--output',required=True);p.add_argument('--model',default='large-v3');p.add_argument('--device',default='cuda');p.add_argument('--compute-type',default='int8_float16');a=p.parse_args()
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--audio', required=True)
+parser.add_argument('--output', required=True)
+parser.add_argument('--model', default='large-v3')
+parser.add_argument('--device', default='cuda')
+parser.add_argument('--compute-type', default='int8_float16')
+args = parser.parse_args()
+
 from faster_whisper import WhisperModel
-m=WhisperModel(a.model,device=a.device,compute_type=a.compute_type);ss,info=m.transcribe(a.audio);ss=list(ss);json.dump({'text':' '.join(s.text.strip() for s in ss),'language':info.language,'segments':[{'start':s.start,'end':s.end,'text':s.text.strip()} for s in ss]},open(a.output,'w',encoding='utf8'),ensure_ascii=False,indent=2)
+
+def transcribe(device, compute_type):
+    model = WhisperModel(args.model, device=device, compute_type=compute_type)
+    segments, info = model.transcribe(args.audio)
+    segments = list(segments)
+    return {'text': ' '.join(s.text.strip() for s in segments), 'language': info.language,
+            'segments': [{'start': s.start, 'end': s.end, 'text': s.text.strip()} for s in segments]}
+
+try:
+    result = transcribe(args.device, args.compute_type)
+except Exception:
+    if args.device != 'cuda':
+        raise
+    result = transcribe('cpu', 'int8')
+
+with open(args.output, 'w', encoding='utf8') as output:
+    json.dump(result, output, ensure_ascii=False, indent=2)
