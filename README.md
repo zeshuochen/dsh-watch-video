@@ -6,7 +6,7 @@ Subtitle-first video transcription and deterministic extractive summaries for De
 
 Requirements: Node.js 20+, Python 3.10+, `yt-dlp`, and `ffmpeg` on PATH. Run `npm install`, then `python -m pip install -r requirements.txt`. On Windows, `winget install yt-dlp.yt-dlp` and `winget install Gyan.FFmpeg` are convenient, or use your platform package manager.
 
-Run `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` to check dependencies and install Python requirements. Bootstrap does not download the Whisper model.
+Run `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` to create or reuse the project `.venv`, print the Python executable it uses, and install Python requirements. Bootstrap does not download the Whisper model. The configured `pythonPath` always wins; without it, the plugin prefers `.venv/Scripts/python.exe` on Windows or `.venv/bin/python` on Unix, then falls back to `python`.
 
 ## First model download
 
@@ -14,7 +14,7 @@ The first real Whisper fallback downloads `large-v3` through faster-whisper/CTra
 
 ## Configuration
 
-Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transcribeScript`, prefix arguments, `device`, `computeType`, `timeoutMs` (default 15 minutes), and `outputLimitBytes` (default 1 MiB per stream). URLs must be HTTP(S) without credentials or control characters.
+Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transcribeScript`, prefix arguments, `device`, `computeType`, `timeoutMs` (default 15 minutes), and `outputLimitBytes` (default 1 MiB per stream). `run()` keeps `shell: false`; timeout and output-limit cleanup terminate the whole process tree: Windows uses controlled `taskkill.exe /PID /T /F`, while Unix uses a detached process group and group `SIGKILL` with a child fallback. URLs must be HTTP(S) without credentials or control characters.
 
 ## Artifacts
 

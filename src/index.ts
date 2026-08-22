@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import net from 'node:net';
@@ -61,22 +61,39 @@ export function validateUrl(value: string) {
 }
 
 type RunResult = { ok: boolean; stdout: string; stderr: string; timedOut?: boolean; outputLimitExceeded?: boolean };
+
+function terminateProcessTree(child: ReturnType<typeof spawn>) {
+  if (child.pid === undefined) return;
+  if (process.platform === 'win32') {
+    execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => undefined);
+    return;
+  }
+  try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+}
+
+export function resolvePythonPath(pluginRoot = fileURLToPath(new URL('..', import.meta.url))) {
+  const candidates = process.platform === 'win32'
+    ? [path.join(pluginRoot, '.venv', 'Scripts', 'python.exe'), path.join(pluginRoot, '.venv', 'bin', 'python')]
+    : [path.join(pluginRoot, '.venv', 'bin', 'python'), path.join(pluginRoot, '.venv', 'Scripts', 'python.exe')];
+  return candidates.find((candidate) => existsSync(candidate)) || 'python';
+}
+
 export function run(file: string, args: string[], cwd: string, options: { timeoutMs?: number; outputLimitBytes?: number } = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const outputLimitBytes = options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT;
   return new Promise<RunResult>((resolve) => {
     let settled = false, stdout = '', stderr = '', stdoutBytes = 0, stderrBytes = 0, timedOut = false, outputLimitExceeded = false;
-    const child = spawn(file, args, { cwd, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(file, args, { cwd, shell: false, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     const finish = (result: RunResult) => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
     const append = (kind: 'stdout' | 'stderr', chunk: Buffer) => {
       const text = chunk.toString('utf8');
       if (kind === 'stdout') { stdoutBytes += chunk.byteLength; stdout += text; } else { stderrBytes += chunk.byteLength; stderr += text; }
-      if (stdoutBytes > outputLimitBytes || stderrBytes > outputLimitBytes) { outputLimitExceeded = true; child.kill('SIGKILL'); }
+      if (stdoutBytes > outputLimitBytes || stderrBytes > outputLimitBytes) { outputLimitExceeded = true; terminateProcessTree(child); }
     };
     child.stdout.on('data', (chunk: Buffer) => append('stdout', chunk)); child.stderr.on('data', (chunk: Buffer) => append('stderr', chunk));
     child.on('error', (error) => finish({ ok: false, stdout, stderr: stderr || error.message, timedOut, outputLimitExceeded }));
     child.on('close', (code) => finish({ ok: code === 0 && !timedOut && !outputLimitExceeded, stdout, stderr: timedOut ? (stderr || 'process timed out') : outputLimitExceeded ? (stderr || 'process output exceeded limit') : stderr, timedOut, outputLimitExceeded }));
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; terminateProcessTree(child); }, timeoutMs);
   });
 }
 
@@ -86,7 +103,7 @@ export function extractiveSummary(text: string, instruction = '') {
 function cleanSubtitle(source: string) { return source.replace(/<[^>]+>/g, '').replace(/^WEBVTT.*?\n/s, '').replace(/^\d+\s*$/gm, '').replace(/^.*-->.*$/gm, '').replace(/\n{3,}/g, '\n\n').trim(); }
 async function transcribe(audio: string, config: any, jobDir: string) {
   const transcriptPath = path.join(jobDir, 'transcript.json'); const device = config.device || 'cuda';
-  return run(config.pythonPath || 'python', [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
+  return run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
 }
 const tempNames = (name: string) => name.endsWith('.vtt') || name.endsWith('.srt') || name.startsWith('source.') || name === 'yt-args.json';
 

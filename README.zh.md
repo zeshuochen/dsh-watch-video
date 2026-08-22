@@ -6,7 +6,7 @@
 
 需要 Node.js 20+、Python 3.10+，并确保 `yt-dlp` 与 `ffmpeg` 在 PATH 中。运行 `npm install`，再运行 `python -m pip install -r requirements.txt`。Windows 可使用 `winget install yt-dlp.yt-dlp` 和 `winget install Gyan.FFmpeg`，也可使用系统包管理器。
 
-运行 `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` 可检查依赖并安装 Python 依赖；bootstrap 不会下载 Whisper 模型。
+运行 `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` 会创建或复用项目 `.venv`、输出实际使用的 Python 可执行文件，并安装 Python 依赖；bootstrap 不会下载 Whisper 模型。显式配置的 `pythonPath` 始终优先；未配置时，Windows 优先使用 `.venv/Scripts/python.exe`，Unix 优先使用 `.venv/bin/python`，最后回退到 `python`。
 
 ## 模型首次下载
 
@@ -14,7 +14,7 @@
 
 ## 配置
 
-配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。URL 必须是 HTTP(S)，不得含凭据或控制字符。
+配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。
 
 ## 产物
 

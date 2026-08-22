@@ -3,10 +3,16 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, run } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
+
+test('run terminates a timed-out process tree', async () => {
+  const result = await run(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], process.cwd(), { timeoutMs: 25 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.ok, false);
+});
 
 test('url rejects local and reserved IP literals', () => {
   for (const host of ['localhost', '127.0.0.1', '10.0.0.1', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '224.0.0.1', '203.0.113.1', '[::1]', '[fc00::1]', '[fe80::1]', '[::ffff:127.0.0.1]']) {
