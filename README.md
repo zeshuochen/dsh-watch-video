@@ -6,7 +6,7 @@ Subtitle-first video transcription and deterministic extractive summaries for De
 
 Requirements: Node.js 20+, Python 3.10+, `yt-dlp`, and `ffmpeg` on PATH. Run `npm install`, then `python -m pip install -r requirements.txt`. On Windows, `winget install yt-dlp.yt-dlp` and `winget install Gyan.FFmpeg` are convenient, or use your platform package manager.
 
-Run `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` to create or reuse the project `.venv`, print the Python executable it uses, and install Python requirements. Bootstrap does not download the Whisper model. The configured `pythonPath` always wins; without it, the plugin prefers `.venv/Scripts/python.exe` on Windows or `.venv/bin/python` on Unix, then falls back to `python`.
+Run `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` to create or reuse the project `.venv`, print the Python executable it uses, and install Python requirements. Bootstrap does not download the Whisper model. Run `npm run doctor` to check Node.js, Python, `yt-dlp`, and `ffmpeg`; it prints installation hints without exposing environment variables or credentials. Use `node scripts/doctor.mjs --files-only` for an offline bootstrap/dependency file check. The configured `pythonPath` always wins; without it, the plugin prefers `.venv/Scripts/python.exe` on Windows or `.venv/bin/python` on Unix, then falls back to `python`.
 
 ## First model download
 

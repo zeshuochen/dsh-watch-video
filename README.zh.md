@@ -6,7 +6,7 @@
 
 需要 Node.js 20+、Python 3.10+，并确保 `yt-dlp` 与 `ffmpeg` 在 PATH 中。运行 `npm install`，再运行 `python -m pip install -r requirements.txt`。Windows 可使用 `winget install yt-dlp.yt-dlp` 和 `winget install Gyan.FFmpeg`，也可使用系统包管理器。
 
-运行 `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` 会创建或复用项目 `.venv`、输出实际使用的 Python 可执行文件，并安装 Python 依赖；bootstrap 不会下载 Whisper 模型。显式配置的 `pythonPath` 始终优先；未配置时，Windows 优先使用 `.venv/Scripts/python.exe`，Unix 优先使用 `.venv/bin/python`，最后回退到 `python`。
+运行 `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1` 会创建或复用项目 `.venv`、输出实际使用的 Python 可执行文件，并安装 Python 依赖；bootstrap 不会下载 Whisper 模型。运行 `npm run doctor` 可检查 Node.js、Python、`yt-dlp` 和 `ffmpeg`，只输出安装提示，不会泄露环境变量或凭证；`node scripts/doctor.mjs --files-only` 可执行离线的 bootstrap/依赖文件检查。显式配置的 `pythonPath` 始终优先；未配置时，Windows 优先使用 `.venv/Scripts/python.exe`，Unix 优先使用 `.venv/bin/python`，最后回退到 `python`。
 
 ## 模型首次下载
 
