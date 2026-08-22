@@ -14,7 +14,7 @@ The first real Whisper fallback downloads `large-v3` through faster-whisper/CTra
 
 ## Configuration
 
-Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transcribeScript`, prefix arguments, `device`, `computeType`, `timeoutMs` (default 15 minutes), and `outputLimitBytes` (default 1 MiB per stream). `run()` keeps `shell: false`; timeout and output-limit cleanup terminate the whole process tree: Windows uses controlled `taskkill.exe /PID /T /F`, while Unix uses a detached process group and group `SIGKILL` with a child fallback. URLs must be HTTP(S) without credentials or control characters.
+Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transcribeScript`, prefix arguments, `device`, `computeType`, `timeoutMs` (default 15 minutes), and `outputLimitBytes` (default 1 MiB per stream). Whisper fallback uses the host-process FIFO queue controlled by `maxConcurrentTranscriptions`; subtitle jobs do not enter this queue, and queue waits time out with the job timeout. `run()` keeps `shell: false`; timeout and output-limit cleanup terminate the whole process tree: Windows uses controlled `taskkill.exe /PID /T /F`, while Unix uses a detached process group and group `SIGKILL` with a child fallback. URLs must be HTTP(S) without credentials or control characters.
 
 | Setting | Default | Valid range |
 | --- | ---: | --- |
@@ -25,6 +25,7 @@ Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transc
 | `maxOutputBytes` | 1048576 | 1 to 67108864, safe integer |
 | `retentionDays` | 30 | 1 to 3650, safe integer |
 | `maxTotalBytes` | 10737418240 | 1 to 107374182400, safe integer |
+| `maxConcurrentTranscriptions` | 1 | 1 to 4, safe integer |
 
 Invalid resource values fail before a job directory or external process is started. Whisper requires `transcript.json` to be an object with non-empty string `text`; when present, `segments` must be an array whose entries contain numeric `start`/`end` and string `text`.
 

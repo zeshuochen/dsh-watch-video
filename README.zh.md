@@ -14,7 +14,7 @@
 
 ## 配置
 
-配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。产物保留配置 `retentionDays` 默认 30 天（1–3650），`maxTotalBytes` 默认 10 GiB（1–100 GiB）；两者都必须是安全正整数。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。
+配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。Whisper 回退使用 host 进程内 FIFO 队列，由 `maxConcurrentTranscriptions` 控制；字幕任务不进入该队列，排队等待会使用任务超时并及时失败释放。产物保留配置 `retentionDays` 默认 30 天（1–3650），`maxTotalBytes` 默认 10 GiB（1–100 GiB）；两者都必须是安全正整数。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。`maxConcurrentTranscriptions` 默认 1，范围 1–4。
 
 ## 产物
 

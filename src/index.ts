@@ -17,6 +17,7 @@ export const Config = Schema.object({
   maxDurationSeconds: Schema.number().default(60 * 60), maxFileBytes: Schema.number().default(500 * 1024 * 1024),
   maxOutputBytes: Schema.number().default(1024 * 1024),
   retentionDays: Schema.number().default(30), maxTotalBytes: Schema.number().default(10 * 1024 * 1024 * 1024),
+  maxConcurrentTranscriptions: Schema.number().default(1),
 });
 
 const defaultTranscribeScript = fileURLToPath(new URL('../scripts/transcribe.py', import.meta.url));
@@ -31,6 +32,7 @@ const RESOURCE_LIMITS = {
   maxOutputBytes: [1, 64 * 1024 * 1024],
   retentionDays: [1, 3650],
   maxTotalBytes: [1, 100 * 1024 * 1024 * 1024],
+  maxConcurrentTranscriptions: [1, 4],
 } as const;
 
 export function validateResourceConfig(config: Record<string, unknown>) {
@@ -229,9 +231,58 @@ export function selectSubtitle(files: SubtitleFile[], requested?: string) {
     return a.name.localeCompare(b.name);
   })[0];
 }
+type SemaphoreWaiter = { resolve: (release: () => void) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout; settled: boolean };
+
+export class FifoSemaphore {
+  private available: number;
+  private readonly queue: SemaphoreWaiter[] = [];
+  constructor(capacity: number) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 4) throw new Error('invalid semaphore capacity');
+    this.available = capacity;
+  }
+  acquire(timeoutMs: number) {
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: SemaphoreWaiter = { resolve, reject, settled: false };
+      waiter.timer = setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        const index = this.queue.indexOf(waiter);
+        if (index >= 0) this.queue.splice(index, 1);
+        reject(new Error('transcription queue wait timed out'));
+      }, timeoutMs);
+      this.queue.push(waiter);
+      this.drain();
+    });
+  }
+  private drain() {
+    while (this.available > 0 && this.queue.length) {
+      const waiter = this.queue.shift()!;
+      if (waiter.settled) continue;
+      waiter.settled = true;
+      if (waiter.timer) clearTimeout(waiter.timer);
+      this.available--;
+      let released = false;
+      waiter.resolve(() => { if (!released) { released = true; this.available++; this.drain(); } });
+    }
+  }
+}
+
+const transcriptionSemaphores = new Map<number, FifoSemaphore>();
+function getTranscriptionSemaphore(config: any) {
+  const capacity = config.maxConcurrentTranscriptions ?? 1;
+  let semaphore = transcriptionSemaphores.get(capacity);
+  if (!semaphore) { semaphore = new FifoSemaphore(capacity); transcriptionSemaphores.set(capacity, semaphore); }
+  return semaphore;
+}
+
 async function transcribe(audio: string, config: any, jobDir: string) {
-  const transcriptPath = path.join(jobDir, 'transcript.json'); const device = config.device || 'cuda';
-  return run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
+  const release = await getTranscriptionSemaphore(config).acquire(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const transcriptPath = path.join(jobDir, 'transcript.json'); const device = config.device || 'cuda';
+    return await run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
+  } finally {
+    release();
+  }
 }
 const tempNames = (name: string) => name.endsWith('.vtt') || name.endsWith('.srt') || name.startsWith('source.') || name === 'yt-args.json';
 
