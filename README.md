@@ -16,6 +16,16 @@ The first real Whisper fallback downloads `large-v3` through faster-whisper/CTra
 
 Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transcribeScript`, prefix arguments, `device`, `computeType`, `timeoutMs` (default 15 minutes), and `outputLimitBytes` (default 1 MiB per stream). `run()` keeps `shell: false`; timeout and output-limit cleanup terminate the whole process tree: Windows uses controlled `taskkill.exe /PID /T /F`, while Unix uses a detached process group and group `SIGKILL` with a child fallback. URLs must be HTTP(S) without credentials or control characters.
 
+| Setting | Default | Valid range |
+| --- | ---: | --- |
+| `timeoutMs` | 900000 | 1 to 86400000, safe integer |
+| `outputLimitBytes` | 1048576 | 1 to 67108864, safe integer |
+| `maxDurationSeconds` | 3600 | 1 to 86400, safe integer |
+| `maxFileBytes` | 524288000 | 1 to 10737418240, safe integer |
+| `maxOutputBytes` | 1048576 | 1 to 67108864, safe integer |
+
+Invalid resource values fail before a job directory or external process is started. Whisper requires `transcript.json` to be an object with non-empty string `text`; when present, `segments` must be an array whose entries contain numeric `start`/`end` and string `text`.
+
 ## Artifacts
 
 Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, and `summary.md`; Whisper jobs also contain `audio.wav` and `transcript.json`. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.

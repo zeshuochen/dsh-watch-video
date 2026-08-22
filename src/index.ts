@@ -22,6 +22,52 @@ const defaultTranscribeScript = fileURLToPath(new URL('../scripts/transcribe.py'
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_OUTPUT_LIMIT = 1024 * 1024;
 
+const RESOURCE_LIMITS = {
+  timeoutMs: [1, 24 * 60 * 60 * 1000],
+  outputLimitBytes: [1, 64 * 1024 * 1024],
+  maxDurationSeconds: [1, 24 * 60 * 60],
+  maxFileBytes: [1, 10 * 1024 * 1024 * 1024],
+  maxOutputBytes: [1, 64 * 1024 * 1024],
+} as const;
+
+export function validateResourceConfig(config: Record<string, unknown>) {
+  for (const [name, bounds] of Object.entries(RESOURCE_LIMITS)) {
+    const value = config[name];
+    if (value === undefined) continue;
+    const [minimum, maximum] = bounds;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+      throw new Error('invalid configuration: ' + name + ' must be a finite positive integer between ' + minimum + ' and ' + maximum);
+    }
+  }
+}
+
+type Transcript = { text: string; segments?: Array<{ start: number; end: number; text: string }> };
+
+export function validateTranscript(value: unknown): Transcript {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('transcript protocol error: transcript.json must contain an object');
+  const transcript = value as Record<string, unknown>;
+  if (typeof transcript.text !== 'string' || !transcript.text.trim()) throw new Error('transcript protocol error: text must be a non-empty string');
+  if (transcript.segments === undefined) return { text: transcript.text.trim() };
+  if (!Array.isArray(transcript.segments)) throw new Error('transcript protocol error: segments must be an array');
+  for (const [index, segment] of transcript.segments.entries()) {
+    if (segment === null || typeof segment !== 'object' || Array.isArray(segment)) throw new Error('transcript protocol error: segments[' + index + '] must be an object with start, end, and text');
+    const item = segment as Record<string, unknown>;
+    if (typeof item.start !== 'number' || !Number.isFinite(item.start) || typeof item.end !== 'number' || !Number.isFinite(item.end) || typeof item.text !== 'string') throw new Error('transcript protocol error: segments[' + index + '] must contain numeric start/end and string text');
+    if (item.start < 0 || item.end < item.start) throw new Error('transcript protocol error: segments[' + index + '] has invalid start/end range');
+  }
+  return { text: transcript.text.trim(), segments: transcript.segments as Transcript['segments'] };
+}
+
+export async function readTranscript(transcriptPath: string) {
+  let raw: string;
+  try { raw = await fs.readFile(transcriptPath, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('transcript protocol error: transcript.json is missing'); throw error; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); }
+  catch { throw new Error('transcript protocol error: transcript.json contains invalid JSON'); }
+  return validateTranscript(parsed);
+}
+
 function isBlockedIpv4(host: string) {
   const parts = host.split('.').map(Number);
   const n = parts.reduce((value, part) => value * 256 + part, 0);
@@ -139,6 +185,7 @@ async function transcribe(audio: string, config: any, jobDir: string) {
 const tempNames = (name: string) => name.endsWith('.vtt') || name.endsWith('.srt') || name.startsWith('source.') || name === 'yt-args.json';
 
 export async function understand(args: any, config: any) {
+  validateResourceConfig(config);
   const url = validateUrl(args.url); const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
   await fs.mkdir(jobDir, { recursive: true });
   const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' }; const metadataPath = path.join(jobDir, 'metadata.json');
@@ -157,7 +204,7 @@ export async function understand(args: any, config: any) {
       if (!result.ok) throw new Error(result.stderr || 'yt-dlp audio extraction failed');
       const audioSize = (await fs.stat(audio)).size; if (audioSize > (config.maxFileBytes ?? 500 * 1024 * 1024)) throw new Error('audio output exceeded maxFileBytes');
       result = await transcribe(audio, config, jobDir); if (!result.ok) throw new Error(result.stderr || 'transcription failed');
-      const parsed = JSON.parse(await fs.readFile(path.join(jobDir, 'transcript.json'), 'utf8')); text = typeof parsed.text === 'string' ? parsed.text.trim() : ''; if (!text) throw new Error('transcription produced empty text');
+      const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text;
     }
     const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md');
     await fs.writeFile(transcriptPath, text); await fs.writeFile(summaryPath, extractiveSummary(text, args.summaryInstruction));
