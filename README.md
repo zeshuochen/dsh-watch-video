@@ -23,12 +23,16 @@ Configure the output directory and optionally `ytDlpPath`, `pythonPath`, `transc
 | `maxDurationSeconds` | 3600 | 1 to 86400, safe integer |
 | `maxFileBytes` | 524288000 | 1 to 10737418240, safe integer |
 | `maxOutputBytes` | 1048576 | 1 to 67108864, safe integer |
+| `retentionDays` | 30 | 1 to 3650, safe integer |
+| `maxTotalBytes` | 10737418240 | 1 to 107374182400, safe integer |
 
 Invalid resource values fail before a job directory or external process is started. Whisper requires `transcript.json` to be an object with non-empty string `text`; when present, `segments` must be an array whose entries contain numeric `start`/`end` and string `text`.
 
 ## Artifacts
 
 Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, and `summary.md`; Whisper jobs also contain `audio.wav` and `transcript.json`. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.
+
+Before each new job, the plugin applies the retention policy. It skips the current job, jobs whose `metadata.json` status is `running`, directories with invalid or mismatched metadata, and top-level symbolic links. Completed or failed jobs older than `retentionDays` are removed first; if the remaining artifacts exceed `maxTotalBytes`, eligible jobs are then removed from oldest to newest until under the limit. Cleanup only removes job directories directly inside `outputDir` and never follows symbolic links, so paths outside `outputDir` are protected.
 
 ## Copyright and responsible use
 

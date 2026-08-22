@@ -16,6 +16,7 @@ export const Config = Schema.object({
   timeoutMs: Schema.number().default(15 * 60 * 1000), outputLimitBytes: Schema.number(),
   maxDurationSeconds: Schema.number().default(60 * 60), maxFileBytes: Schema.number().default(500 * 1024 * 1024),
   maxOutputBytes: Schema.number().default(1024 * 1024),
+  retentionDays: Schema.number().default(30), maxTotalBytes: Schema.number().default(10 * 1024 * 1024 * 1024),
 });
 
 const defaultTranscribeScript = fileURLToPath(new URL('../scripts/transcribe.py', import.meta.url));
@@ -28,6 +29,8 @@ const RESOURCE_LIMITS = {
   maxDurationSeconds: [1, 24 * 60 * 60],
   maxFileBytes: [1, 10 * 1024 * 1024 * 1024],
   maxOutputBytes: [1, 64 * 1024 * 1024],
+  retentionDays: [1, 3650],
+  maxTotalBytes: [1, 100 * 1024 * 1024 * 1024],
 } as const;
 
 export function validateResourceConfig(config: Record<string, unknown>) {
@@ -42,6 +45,54 @@ export function validateResourceConfig(config: Record<string, unknown>) {
 }
 
 type Transcript = { text: string; segments?: Array<{ start: number; end: number; text: string }> };
+
+type CleanupEntry = { name: string; fullPath: string; modifiedAt: number; size: number; running: boolean; deletable: boolean };
+
+async function directorySize(dir: string): Promise<number> {
+  let total = 0;
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += await directorySize(fullPath);
+    else if (entry.isFile()) total += (await fs.stat(fullPath)).size;
+  }
+  return total;
+}
+
+/** Remove only safe, non-running job directories before starting a new job. */
+export async function cleanupArtifacts(outputDir: string, options: { retentionDays?: number; maxTotalBytes?: number; currentJobId?: string; now?: number } = {}) {
+  validateResourceConfig({ retentionDays: options.retentionDays, maxTotalBytes: options.maxTotalBytes });
+  const root = path.resolve(outputDir);
+  const now = options.now ?? Date.now();
+  const retentionDays = options.retentionDays ?? 30;
+  const maxTotalBytes = options.maxTotalBytes ?? 10 * 1024 * 1024 * 1024;
+  const cutoff = now - retentionDays * 24 * 60 * 60 * 1000;
+  const entries: CleanupEntry[] = [];
+  let total = 0;
+  for (const item of await fs.readdir(root, { withFileTypes: true }).catch(() => [] as import('node:fs').Dirent[])) {
+    if (!item.isDirectory() || item.isSymbolicLink()) continue;
+    const fullPath = path.resolve(root, item.name);
+    if (path.dirname(fullPath) !== root) continue;
+    let metadata: any;
+    try {
+      metadata = JSON.parse(await fs.readFile(path.join(fullPath, 'metadata.json'), 'utf8'));
+      if (metadata.jobId !== item.name) continue;
+    } catch { continue; }
+    const stat = await fs.stat(fullPath);
+    const size = await directorySize(fullPath);
+    total += size;
+    entries.push({ name: item.name, fullPath, modifiedAt: stat.mtimeMs, size, running: metadata.status === 'running', deletable: metadata.status !== 'running' && item.name !== options.currentJobId });
+  }
+  entries.sort((a, b) => a.modifiedAt - b.modifiedAt || a.name.localeCompare(b.name));
+  const removed: string[] = [];
+  for (const entry of entries) {
+    if (!entry.deletable || (entry.modifiedAt >= cutoff && total <= maxTotalBytes)) continue;
+    await fs.rm(entry.fullPath, { recursive: true, force: true });
+    total -= entry.size;
+    removed.push(entry.name);
+  }
+  return { removed, totalBytes: total };
+}
 
 export function validateTranscript(value: unknown): Transcript {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('transcript protocol error: transcript.json must contain an object');
@@ -186,7 +237,9 @@ const tempNames = (name: string) => name.endsWith('.vtt') || name.endsWith('.srt
 
 export async function understand(args: any, config: any) {
   validateResourceConfig(config);
-  const url = validateUrl(args.url); const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
+  const url = validateUrl(args.url);
+  await cleanupArtifacts(config.outputDir, { retentionDays: config.retentionDays, maxTotalBytes: config.maxTotalBytes });
+  const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
   await fs.mkdir(jobDir, { recursive: true });
   const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' }; const metadataPath = path.join(jobDir, 'metadata.json');
   await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));

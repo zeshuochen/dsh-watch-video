@@ -14,11 +14,13 @@
 
 ## 配置
 
-配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。
+配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。产物保留配置 `retentionDays` 默认 30 天（1–3650），`maxTotalBytes` 默认 10 GiB（1–100 GiB）；两者都必须是安全正整数。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。
 
 ## 产物
 
 每个任务写入 UUID 目录，包含 `metadata.json`、`transcript.txt`、`summary.md`；Whisper 模式还包含 `audio.wav` 与 `transcript.json`。工具只返回产物路径和短摘要，不把完整 transcript 塞进工具返回。不会保留原视频文件。
+
+每次新任务开始前都会执行保留策略。清理会跳过当前任务、`metadata.json` 状态为 `running` 的任务、metadata 缺失或 jobId 不匹配的目录，以及 outputDir 直接子项中的符号链接。先删除超过 `retentionDays` 的已完成/失败任务；如果剩余产物总大小超过 `maxTotalBytes`，再按任务目录修改时间从旧到新删除可清理任务，直到低于上限。清理只处理 `outputDir` 直接下的任务目录，不跟随符号链接，也不会删除 outputDir 外部目标。
 
 ## 版权与责任边界
 
