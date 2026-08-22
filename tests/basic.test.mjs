@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
@@ -25,6 +25,20 @@ test('url rejects local and reserved IP literals', () => {
 });
 
 test('summary', () => assert.match(extractiveSummary('hello', 'focus'), /focus/));
+
+test('subtitle selection prioritizes manual, requested language, then filename', () => {
+  const files = [{ name: 'z.en.vtt', manual: false, language: 'en' }, { name: 'a.zh-CN.vtt', manual: false, language: 'zh-CN' }, { name: 'z.zh-Hans.vtt', manual: true, language: 'zh-Hans' }, { name: 'a.zh.vtt', manual: true, language: 'zh' }];
+  assert.equal(selectSubtitle(files, 'zh-CN').name, 'a.zh.vtt');
+  assert.equal(selectSubtitle(files.filter((file) => !file.manual), 'zh').name, 'a.zh-CN.vtt');
+  assert.equal(selectSubtitle([{ name: 'b.en.vtt', language: 'en' }, { name: 'a.fr.vtt', language: 'fr' }], 'zh').name, 'a.fr.vtt');
+});
+
+test('subtitle parser handles VTT, SRT, metadata, tags, entities, and adjacent duplicates', () => {
+  const vtt = 'WEBVTT\n\nNOTE comment\nignored\n\n1\n00:00:00,000 --> 00:00:01,000 align:start\n<b>Hello &amp; welcome</b>\n\n2\n00:00:01,000 --> 00:00:02,000\nHello &amp; welcome\n\nSTYLE\nignored';
+  assert.equal(cleanSubtitle(vtt), 'Hello & welcome');
+  assert.equal(cleanSubtitle('1\n00:00:00,000 --> 00:00:01,000\nFirst\n\n2\n00:00:01,000 --> 00:00:02,000\nSecond'), 'First\nSecond');
+  assert.equal(cleanSubtitle('WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n'), '');
+});
 
 test('fake subtitle pipeline adds yt-dlp limits and cleans temporary subtitles', async () => {
   const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-'));

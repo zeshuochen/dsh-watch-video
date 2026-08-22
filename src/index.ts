@@ -12,7 +12,7 @@ export const inject = ['tools'];
 export const Config = Schema.object({
   outputDir: Schema.string().required(), ytDlpPath: Schema.string(), pythonPath: Schema.string(),
   transcribeScript: Schema.string(), ytDlpPrefixArgs: Schema.array(String), pythonPrefixArgs: Schema.array(String),
-  device: Schema.string().default('cuda'), computeType: Schema.string().default('int8_float16'),
+  device: Schema.string().default('cuda'), computeType: Schema.string().default('int8_float16'), language: Schema.string(),
   timeoutMs: Schema.number().default(15 * 60 * 1000), outputLimitBytes: Schema.number(),
   maxDurationSeconds: Schema.number().default(60 * 60), maxFileBytes: Schema.number().default(500 * 1024 * 1024),
   maxOutputBytes: Schema.number().default(1024 * 1024),
@@ -100,7 +100,38 @@ export function run(file: string, args: string[], cwd: string, options: { timeou
 export function extractiveSummary(text: string, instruction = '') {
   return '# Video Summary\n\n<!-- summaryInstruction: ' + instruction.replace(/-->/g, '') + ' -->\n\n' + text.split(/\n+/).filter(Boolean).slice(0, 24).map((line) => '- ' + line).join('\n') + '\n';
 }
-function cleanSubtitle(source: string) { return source.replace(/<[^>]+>/g, '').replace(/^WEBVTT.*?\n/s, '').replace(/^\d+\s*$/gm, '').replace(/^.*-->.*$/gm, '').replace(/\n{3,}/g, '\n\n').trim(); }
+const HTML_ENTITIES: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&apos;': "'", '&nbsp;': ' ' };
+function decodeEntities(text: string) { return text.replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (entity) => HTML_ENTITIES[entity]); }
+export function cleanSubtitle(source: string, format?: string) {
+  const lines = source.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+  const output: string[] = [];
+  let skip = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (/^(NOTE|STYLE|REGION)(?:\s|$)/i.test(line)) { skip = true; continue; }
+    if (!line) { skip = false; continue; }
+    if (skip || /^WEBVTT(?:\s|$)/i.test(line) || /^X-TIMESTAMP-MAP=/i.test(line)) continue;
+    if (/^\d+$/.test(line) || /\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->/.test(line) || /-->/.test(line)) continue;
+    const cleaned = decodeEntities(line.replace(/<[^>]*>/g, '').replace(/\s+$/g, '').trim());
+    if (cleaned && output[output.length - 1] !== cleaned) output.push(cleaned);
+  }
+  return output.join('\n').trim();
+}
+function languageMatches(candidate: string, requested?: string) {
+  if (!requested) return false;
+  const a = candidate.toLowerCase().replace(/_/g, '-'); const b = requested.toLowerCase().replace(/_/g, '-');
+  return a === b || a.split('-')[0] === b.split('-')[0];
+}
+export type SubtitleFile = { name: string; manual?: boolean; language?: string };
+export function selectSubtitle(files: SubtitleFile[], requested?: string) {
+  return [...files].sort((a, b) => {
+    const manual = Number(Boolean(b.manual)) - Number(Boolean(a.manual));
+    if (manual) return manual;
+    const language = Number(languageMatches(b.language || '', requested)) - Number(languageMatches(a.language || '', requested));
+    if (language) return language;
+    return a.name.localeCompare(b.name);
+  })[0];
+}
 async function transcribe(audio: string, config: any, jobDir: string) {
   const transcriptPath = path.join(jobDir, 'transcript.json'); const device = config.device || 'cuda';
   return run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
@@ -117,7 +148,9 @@ export async function understand(args: any, config: any) {
   try {
     const subtitleArgs = [...limits, '--skip-download', '--write-subs', '--write-auto-subs', '--sub-format', 'vtt', '-o', path.join(jobDir, 'source.%(ext)s'), url.href];
     let result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...subtitleArgs], jobDir, runOptions); let text = '';
-    for (const subtitle of (await fs.readdir(jobDir)).filter((n) => n.endsWith('.vtt') || n.endsWith('.srt'))) { text = cleanSubtitle(await fs.readFile(path.join(jobDir, subtitle), 'utf8')); if (text) break; }
+    const subtitleNames = (await fs.readdir(jobDir)).filter((n) => /\.(?:vtt|srt)$/i.test(n));
+    const subtitle = selectSubtitle(subtitleNames.map((name) => ({ name, manual: !/\.auto\./i.test(name), language: name.match(/\.([A-Za-z]{2,}(?:-[A-Za-z0-9]+)?)\.(?:vtt|srt)$/i)?.[1] })), config.language);
+    if (subtitle) text = cleanSubtitle(await fs.readFile(path.join(jobDir, subtitle.name), 'utf8'), path.extname(subtitle.name));
     if (!result.ok || !text) {
       metadata.method = 'whisper'; const audio = path.join(jobDir, 'audio.wav');
       result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...limits, '-x', '--audio-format', 'wav', '-o', audio, url.href], jobDir, runOptions);
