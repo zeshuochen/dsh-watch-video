@@ -1,11 +1,37 @@
 name: CI
 on: [push, pull_request]
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: {node-version: 20}
-      - run: npm install
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
       - run: npm test
+      - run: npm run typecheck
+      - run: npm run pack:check
+      - run: python -m py_compile scripts/transcribe.py
+
+  windows-runtime:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: node scripts/doctor.mjs --files-only
+      - name: Verify bootstrap and dependency files
+        shell: pwsh
+        run: |
+          if (-not (Test-Path scripts/bootstrap.ps1)) { throw 'scripts/bootstrap.ps1 is missing' }
+          if (-not (Test-Path requirements.txt)) { throw 'requirements.txt is missing' }
+          if (-not (Test-Path scripts/transcribe.py)) { throw 'scripts/transcribe.py is missing' }
+          if (-not (Select-String -Path scripts/bootstrap.ps1 -Pattern 'requirements.txt' -Quiet)) { throw 'bootstrap.ps1 does not reference requirements.txt' }
+          if (Select-String -Path scripts/bootstrap.ps1 -Pattern 'WhisperModel|large-v3|download' -Quiet) { throw 'bootstrap.ps1 must not download a Whisper model' }
+          python -m py_compile scripts/transcribe.py

@@ -5,3 +5,6 @@
         outputDir: "${DSH_HOME}/video-understand/jobs"
         device: cuda
         computeType: int8_float16
+        retentionDays: 30
+        maxTotalBytes: 10737418240
+        maxConcurrentTranscriptions: 1
