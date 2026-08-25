@@ -46,7 +46,72 @@ export function validateResourceConfig(config: Record<string, unknown>) {
   }
 }
 
-type Transcript = { text: string; segments?: Array<{ start: number; end: number; text: string }> };
+export type TranscriptSegment = { start: number; end: number; text: string };
+export type Transcript = { text: string; segments?: TranscriptSegment[] };
+export type SubtitleCue = TranscriptSegment;
+
+function parseTimestamp(value: string): number {
+  const match = /^(\d{2,}):(\d{2}):(\d{2})[.,](\d{3})$/.exec(value);
+  if (!match) throw new Error('invalid subtitle timestamp: ' + value);
+  const hours = Number(match[1]); const minutes = Number(match[2]); const seconds = Number(match[3]); const milliseconds = Number(match[4]);
+  if (minutes >= 60 || seconds >= 60 || !Number.isFinite(hours)) throw new Error('invalid subtitle timestamp: ' + value);
+  return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000;
+}
+
+function cleanCueText(lines: string[]) {
+  return lines.map((line) => decodeEntities(line.replace(/<[^>]*>/g, '').trim())).join('\n').trim();
+}
+
+export function parseSubtitleCues(source: string): SubtitleCue[] {
+  const lines = source.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+  const cues: SubtitleCue[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index].trim();
+    if (!line) { index++; continue; }
+    if (/^(NOTE|STYLE|REGION)(?:\s|$)/i.test(line)) { index++; while (index < lines.length && lines[index].trim()) index++; continue; }
+    if (/^WEBVTT(?:\s|$)/i.test(line)) { index++; continue; }
+    const match = /^(\d{2,}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3})(?:\s+.*)?$/.exec(line);
+    if (!match) { index++; continue; }
+    const start = parseTimestamp(match[1]); const end = parseTimestamp(match[2]);
+    const textLines: string[] = []; index++;
+    while (index < lines.length && lines[index].trim()) { textLines.push(lines[index]); index++; }
+    const text = cleanCueText(textLines);
+    if (text) cues.push({ start, end, text });
+    else if (end <= start) throw new Error('invalid subtitle cue time range');
+  }
+  return cues;
+}
+
+function formatSrtTimestamp(seconds: number) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) throw new Error('invalid SRT timestamp');
+  const millisecondsTotal = Math.round(seconds * 1000);
+  const hours = Math.floor(millisecondsTotal / 3_600_000); const minutes = Math.floor(millisecondsTotal / 60_000) % 60;
+  const secs = Math.floor(millisecondsTotal / 1000) % 60; const milliseconds = millisecondsTotal % 1000;
+  return [hours, minutes, secs].map((part) => String(part).padStart(2, '0')).join(':') + ',' + String(milliseconds).padStart(3, '0');
+}
+
+export function formatSrt(segments: TranscriptSegment[], jobPath = 'job') {
+  const cues: string[] = [];
+  for (const [index, segment] of segments.entries()) {
+    if (segment === null || typeof segment !== 'object' || typeof segment.start !== 'number' || !Number.isFinite(segment.start) || segment.start < 0 || typeof segment.end !== 'number' || !Number.isFinite(segment.end) || segment.end <= segment.start || typeof segment.text !== 'string') {
+      throw new Error('invalid subtitle segment for job ' + jobPath + ', segment ' + (index + 1));
+    }
+    const text = cleanCueText(segment.text.replace(/\r\n?/g, '\n').split('\n'));
+    if (!text) continue;
+    const start = formatSrtTimestamp(segment.start); const end = formatSrtTimestamp(segment.end);
+    if (start === end) throw new Error('invalid subtitle segment for job ' + jobPath + ', segment ' + (index + 1) + ': rounded end must be greater than start');
+    cues.push(String(cues.length + 1) + '\r\n' + start + ' --> ' + end + '\r\n' + text.replace(/\n/g, '\r\n'));
+  }
+  return cues.length ? cues.join('\r\n\r\n') + '\r\n' : '';
+}
+
+type AtomicFileOps = { writeFile: (file: string, data: string, encoding: 'utf8') => Promise<void>; rename: (from: string, to: string) => Promise<void>; unlink: (file: string) => Promise<void> };
+export async function writeSrtAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
+  const temporary = path.join(path.dirname(filePath), '.transcript.srt-' + crypto.randomUUID() + '.tmp');
+  try { await ops.writeFile(temporary, content, 'utf8'); await ops.rename(temporary, filePath); }
+  catch (error) { await ops.unlink(temporary).catch(() => undefined); throw error; }
+}
 
 type CleanupEntry = { name: string; fullPath: string; modifiedAt: number; size: number; running: boolean; deletable: boolean };
 
@@ -106,7 +171,7 @@ export function validateTranscript(value: unknown): Transcript {
     if (segment === null || typeof segment !== 'object' || Array.isArray(segment)) throw new Error('transcript protocol error: segments[' + index + '] must be an object with start, end, and text');
     const item = segment as Record<string, unknown>;
     if (typeof item.start !== 'number' || !Number.isFinite(item.start) || typeof item.end !== 'number' || !Number.isFinite(item.end) || typeof item.text !== 'string') throw new Error('transcript protocol error: segments[' + index + '] must contain numeric start/end and string text');
-    if (item.start < 0 || item.end < item.start) throw new Error('transcript protocol error: segments[' + index + '] has invalid start/end range');
+    if (item.start < 0 || item.end <= item.start) throw new Error('transcript protocol error: segments[' + index + '] has invalid start/end range');
   }
   return { text: transcript.text.trim(), segments: transcript.segments as Transcript['segments'] };
 }
@@ -284,7 +349,7 @@ async function transcribe(audio: string, config: any, jobDir: string) {
     release();
   }
 }
-const tempNames = (name: string) => name.endsWith('.vtt') || name.endsWith('.srt') || name.startsWith('source.') || name === 'yt-args.json';
+const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json';
 
 export async function understand(args: any, config: any) {
   validateResourceConfig(config);
@@ -301,20 +366,27 @@ export async function understand(args: any, config: any) {
     let result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...subtitleArgs], jobDir, runOptions); let text = '';
     const subtitleNames = (await fs.readdir(jobDir)).filter((n) => /\.(?:vtt|srt)$/i.test(n));
     const subtitle = selectSubtitle(subtitleNames.map((name) => ({ name, manual: !/\.auto\./i.test(name), language: name.match(/\.([A-Za-z]{2,}(?:-[A-Za-z0-9]+)?)\.(?:vtt|srt)$/i)?.[1] })), config.language);
-    if (subtitle) text = cleanSubtitle(await fs.readFile(path.join(jobDir, subtitle.name), 'utf8'), path.extname(subtitle.name));
+    let srtSegments: SubtitleCue[] | undefined;
+    if (subtitle) {
+      const subtitleSource = await fs.readFile(path.join(jobDir, subtitle.name), 'utf8');
+      text = cleanSubtitle(subtitleSource, path.extname(subtitle.name));
+      srtSegments = parseSubtitleCues(subtitleSource);
+    }
     if (!result.ok || !text) {
       metadata.method = 'whisper'; const audio = path.join(jobDir, 'audio.wav');
       result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...limits, '-x', '--audio-format', 'wav', '-o', audio, url.href], jobDir, runOptions);
       if (!result.ok) throw new Error(result.stderr || 'yt-dlp audio extraction failed');
       const audioSize = (await fs.stat(audio)).size; if (audioSize > (config.maxFileBytes ?? 500 * 1024 * 1024)) throw new Error('audio output exceeded maxFileBytes');
       result = await transcribe(audio, config, jobDir); if (!result.ok) throw new Error(result.stderr || 'transcription failed');
-      const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text;
+      const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text; srtSegments = transcript.segments;
     }
-    const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md');
+    const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md'); const srtPath = path.join(jobDir, 'transcript.srt');
     await fs.writeFile(transcriptPath, text); await fs.writeFile(summaryPath, extractiveSummary(text, args.summaryInstruction));
-    for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
+    if (srtSegments?.length) { await writeSrtAtomic(srtPath, formatSrt(srtSegments, jobDir)); metadata.srt = { generated: true, path: srtPath }; }
+    else { metadata.srt = { generated: false, reason: 'no valid timestamps' }; await fs.rm(srtPath, { force: true }); }
+    for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'transcript.srt', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
     metadata.status = 'completed'; await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-    return { jobDir, method: metadata.method, transcriptPath, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
+    return { jobDir, method: metadata.method, transcriptPath, srtPath: metadata.srt?.generated ? srtPath : undefined, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
   } catch (error) {
     metadata.status = 'failed'; metadata.error = error instanceof Error ? error.message : String(error);
     await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
@@ -323,5 +395,5 @@ export async function understand(args: any, config: any) {
     for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (metadata.status === 'failed' && ['audio.wav', 'transcript.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
   }
 }
-const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string' }, method: { type: 'string', enum: ['subtitles', 'whisper'] }, transcriptPath: { type: 'string' }, summaryPath: { type: 'string' }, metadataPath: { type: 'string' }, transcriptSummary: { type: 'string' } }, required: ['jobDir', 'method', 'transcriptPath', 'summaryPath', 'metadataPath', 'transcriptSummary'] }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string' }, method: { type: 'string', enum: ['subtitles', 'whisper'] }, transcriptPath: { type: 'string' }, srtPath: { type: 'string' }, summaryPath: { type: 'string' }, metadataPath: { type: 'string' }, transcriptSummary: { type: 'string' } }, required: ['jobDir', 'method', 'transcriptPath', 'summaryPath', 'metadataPath', 'transcriptSummary'] }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 export function apply(ctx: any, config: any) { ctx.tools.register((defineTool as any)({ name: 'dsh_video_understand', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) })); }

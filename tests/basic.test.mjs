@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, writeSrtAtomic } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
@@ -40,11 +40,49 @@ test('subtitle parser handles VTT, SRT, metadata, tags, entities, and adjacent d
   assert.equal(cleanSubtitle('WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n'), '');
 });
 
+test('formats SRT timestamps across minutes, hours, rounding, multiline text, and blank cues', () => {
+  const srt = formatSrt([{ start: 59.9996, end: 60.0014, text: '<i>跨分钟</i>\r\n第二行' }, { start: 3599.9996, end: 3600.5004, text: '跨小时' }, { start: 1, end: 2, text: '   ' }], 'job/example');
+  assert.equal(srt, '1\r\n00:01:00,000 --> 00:01:00,001\r\n跨分钟\r\n第二行\r\n\r\n2\r\n01:00:00,000 --> 01:00:00,500\r\n跨小时\r\n');
+});
+
+test('parses cue settings and rejects invalid cue timestamps', () => {
+  assert.deepEqual(parseSubtitleCues('WEBVTT\n\n00:00:01.000 --> 00:00:02.000 position:10%\n<b>中文</b>'), [{ start: 1, end: 2, text: '中文' }]);
+  assert.throws(() => parseSubtitleCues('00:61:00.000 --> 00:62:00.000\ntext'), /invalid subtitle timestamp/);
+});
+
+test('accepts overlapping and adjacent cues without changing their times', () => {
+  const srt = formatSrt([{ start: 0, end: 2, text: 'first' }, { start: 1, end: 2, text: 'overlap' }, { start: 2, end: 3, text: 'adjacent' }], 'job/overlap');
+  assert.match(srt, /00:00:01,000 --> 00:00:02,000/);
+  assert.match(srt, /00:00:02,000 --> 00:00:03,000/);
+});
+
+test('rejects illegal timestamps and non-positive cue durations with job and segment', () => {
+  for (const start of [-1, NaN, Infinity]) assert.throws(() => formatSrt([{ start, end: 2, text: 'bad' }], 'job/bad'), /job\/bad, segment 1/);
+  assert.throws(() => formatSrt([{ start: 1, end: 1, text: 'bad' }], 'job/bad'), /segment 1/);
+  assert.throws(() => formatSrt([{ start: 2, end: 1, text: 'bad' }], 'job/bad'), /segment 1/);
+});
+
+test('atomic SRT failure removes temporary file', async () => {
+  const calls = [];
+  await assert.rejects(() => writeSrtAtomic('C:/job/transcript.srt', 'bad', { writeFile: async (file) => { calls.push(file); }, rename: async () => { throw new Error('rename failed'); }, unlink: async (file) => { calls.push('unlink:' + file); } }), /rename failed/);
+  assert.match(calls[1], /^unlink:/);
+});
+
 test('fake subtitle pipeline adds yt-dlp limits and cleans temporary subtitles', async () => {
   const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-'));
   const result = await understand({ url: 'https://example.test/video', summaryInstruction: 'focus' }, base(out));
-  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['metadata.json', 'summary.md', 'transcript.txt']);
-  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).status, 'completed');
+  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['metadata.json', 'summary.md', 'transcript.srt', 'transcript.txt']);
+  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).srt.generated, true);
+  assert.match(await fs.readFile(result.srtPath, 'utf8'), /00:01:59,500 --> 02:00:00,125/);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('subtitle text without timestamps records the reason and omits SRT', async () => {
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-no-timestamps-'));
+  const result = await understand({ url: 'https://example.test/video' }, base(out, ['--no-timestamps']));
+  const metadata = JSON.parse(await fs.readFile(result.metadataPath, 'utf8'));
+  assert.deepEqual(metadata.srt, { generated: false, reason: 'no valid timestamps' });
+  assert.equal((await fs.readdir(result.jobDir)).includes('transcript.srt'), false);
   await fs.rm(out, { recursive: true, force: true });
 });
 
@@ -53,7 +91,7 @@ test('fake whisper fallback keeps audio and transcript artifacts', async () => {
   const result = await understand({ url: 'https://example.test/video' }, base(out, ['--fail-subs']));
   assert.equal(result.method, 'whisper');
   assert.equal(await fs.readFile(result.transcriptPath, 'utf8'), 'Fallback transcript.');
-  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['audio.wav', 'metadata.json', 'summary.md', 'transcript.json', 'transcript.txt']);
+  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['audio.wav', 'metadata.json', 'summary.md', 'transcript.json', 'transcript.srt', 'transcript.txt']);
   await fs.rm(out, { recursive: true, force: true });
 });
 

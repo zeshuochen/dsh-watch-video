@@ -31,7 +31,7 @@ Invalid resource values fail before a job directory or external process is start
 
 ## Artifacts
 
-Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, and `summary.md`; Whisper jobs also contain `audio.wav` and `transcript.json`. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.
+Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, `summary.md`, and, when valid timestamps exist, `transcript.srt`. `transcript.srt` is a UTF-8 SubRip subtitle file using `HH:MM:SS,mmm --> HH:MM:SS,mmm` timestamps, suitable for subtitle players and downstream editing. Whisper jobs also contain `audio.wav` and `transcript.json`. When no valid timestamps are available, no SRT file is generated and `metadata.json` records the reason. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.
 
 Before each new job, the plugin applies the retention policy. It skips the current job, jobs whose `metadata.json` status is `running`, directories with invalid or mismatched metadata, and top-level symbolic links. Completed or failed jobs older than `retentionDays` are removed first; if the remaining artifacts exceed `maxTotalBytes`, eligible jobs are then removed from oldest to newest until under the limit. Cleanup only removes job directories directly inside `outputDir` and never follows symbolic links, so paths outside `outputDir` are protected.
 
