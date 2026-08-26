@@ -20,6 +20,8 @@
 
 每个任务写入 UUID 目录，包含 `metadata.json`、`transcript.txt`、`summary.md`；存在有效时间戳时还会生成 `transcript.srt`。该文件是 UTF-8 编码的 SubRip 字幕，时间格式为 `HH:MM:SS,mmm --> HH:MM:SS,mmm`，适合字幕播放器和后续编辑；如果没有有效时间戳，则不会生成 SRT，并会在 `metadata.json` 中记录原因。Whisper 模式还包含 `audio.wav` 与 `transcript.json`。工具只返回产物路径和短摘要，不把完整 transcript 塞进工具返回。不会保留原视频文件。
 
+产物会先在目标目录写入完整 UTF-8 临时文件，再优先使用 `rename` 替换。Unix-like 系统在目标已存在时提供预期的原子替换；Windows 可能因目标已存在而拒绝 `rename`，此时插件使用兼容性的 `copyFile` 回退，但由于 Node 未公开 Windows `ReplaceFileW` 接口，不宣称严格原子覆盖。如果替换失败，插件不会先删除原目标，并会返回原始错误。
+
 每次新任务开始前都会执行保留策略。清理会跳过当前任务、`metadata.json` 状态为 `running` 的任务、metadata 缺失或 jobId 不匹配的目录，以及 outputDir 直接子项中的符号链接。先删除超过 `retentionDays` 的已完成/失败任务；如果剩余产物总大小超过 `maxTotalBytes`，再按任务目录修改时间从旧到新删除可清理任务，直到低于上限。清理只处理 `outputDir` 直接下的任务目录，不跟随符号链接，也不会删除 outputDir 外部目标。
 
 ## 版权与责任边界

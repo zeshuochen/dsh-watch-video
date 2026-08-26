@@ -106,13 +106,35 @@ export function formatSrt(segments: TranscriptSegment[], jobPath = 'job') {
   return cues.length ? cues.join('\r\n\r\n') + '\r\n' : '';
 }
 
-export type AtomicFileOps = { writeFile: (file: string, data: string, encoding: 'utf8') => Promise<void>; rename: (from: string, to: string) => Promise<void>; unlink: (file: string) => Promise<void> };
+export type AtomicFileOps = {
+  writeFile: (file: string, data: string, encoding: 'utf8') => Promise<void>;
+  rename: (from: string, to: string) => Promise<void>;
+  copyFile?: (from: string, to: string) => Promise<void>;
+  unlink: (file: string) => Promise<void>;
+  platform?: NodeJS.Platform;
+};
 
-export async function writeFileAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
+function isWindowsReplaceError(error: unknown, platform = process.platform) {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return platform === 'win32' && (code === 'EEXIST' || code === 'EPERM' || code === 'ENOTEMPTY');
+}
+
+/**
+ * Replaces through rename first. Windows has no public Node binding for the
+ * strict ReplaceFileW operation; its fallback copies over the target and is
+ * therefore compatibility-only, not a strict atomic replacement.
+ */
+export async function writeFileAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), copyFile: (from, to) => fs.copyFile(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
   const temporary = path.join(path.dirname(filePath), '.' + path.basename(filePath) + '-' + crypto.randomUUID() + '.tmp');
   try {
     await ops.writeFile(temporary, content, 'utf8');
-    await ops.rename(temporary, filePath);
+    try {
+      await ops.rename(temporary, filePath);
+    } catch (error) {
+      if (!isWindowsReplaceError(error, ops.platform) || !ops.copyFile) throw error;
+      await ops.copyFile(temporary, filePath);
+      await ops.unlink(temporary);
+    }
   } catch (error) {
     await ops.unlink(temporary).catch(() => undefined);
     throw error;

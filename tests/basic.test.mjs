@@ -96,6 +96,70 @@ test('atomic artifact write reports temporary write failure', async () => {
   }), /write failed/);
 });
 
+test('atomic write succeeds when target does not exist and when it already exists', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-replace-'));
+  const target = path.join(dir, 'metadata.json');
+  await writeFileAtomic(target, JSON.stringify({ status: 'running' }), { ...realAtomicOps(), platform: 'linux' });
+  await writeFileAtomic(target, JSON.stringify({ status: 'completed' }), { ...realAtomicOps(), platform: 'linux' });
+  assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).status, 'completed');
+  assert.equal((await fs.readdir(dir)).some((name) => name.endsWith('.tmp')), false);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('Windows existing-target rename fallback replaces content and cleans temp', async () => {
+  const files = new Map([['target', 'running']]); const calls = [];
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file, data) => { calls.push(['write', file]); files.set(file, data); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EEXIST'; throw error; },
+    copyFile: async (from, to) => { calls.push(['copy', from, to]); files.set(to, files.get(from)); },
+    unlink: async (file) => { calls.push(['unlink', file]); files.delete(file); }
+  };
+  await writeFileAtomic('target', 'completed', ops);
+  assert.equal(files.get('target'), 'completed');
+  assert.equal(calls.filter((call) => call[0] === 'unlink').length, 1);
+});
+
+test('replace failure preserves existing target and original error', async () => {
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file) => { if (file === 'target') throw new Error('unexpected target write'); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EEXIST'; throw error; },
+    copyFile: async () => { throw new Error('replace failed'); },
+    unlink: async () => undefined
+  };
+  await assert.rejects(() => writeFileAtomic('target', 'new', ops), /replace failed/);
+});
+
+test('Windows replace failure keeps the existing target content', async () => {
+  const files = new Map([['target', 'running']]);
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file, data) => { files.set(file, data); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EPERM'; throw error; },
+    copyFile: async () => { throw new Error('replace failed'); },
+    unlink: async (file) => { files.delete(file); }
+  };
+  await assert.rejects(() => writeFileAtomic('target', 'completed', ops), /replace failed/);
+  assert.equal(files.get('target'), 'running');
+});
+
+test('Windows fallback does not claim strict atomic replacement', async () => {
+  const calls = [];
+  await writeFileAtomic('target', 'new', {
+    platform: 'win32', writeFile: async (file) => calls.push(['write', file]),
+    rename: async () => { const error = new Error('exists'); error.code = 'EPERM'; throw error; },
+    copyFile: async () => calls.push(['copy']), unlink: async () => calls.push(['unlink'])
+  });
+  assert.deepEqual(calls.map((call) => call[0]), ['write', 'copy', 'unlink']);
+});
+
+function realAtomicOps() { return {
+  writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding),
+  rename: (from, to) => fs.rename(from, to),
+  unlink: (file) => fs.rm(file, { force: true })
+}; }
+
 test('fake subtitle pipeline adds yt-dlp limits and cleans temporary subtitles', async () => {
   const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-'));
   const result = await understand({ url: 'https://example.test/video', summaryInstruction: 'focus' }, base(out));
