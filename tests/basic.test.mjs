@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, writeSrtAtomic } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
@@ -62,10 +62,38 @@ test('rejects illegal timestamps and non-positive cue durations with job and seg
   assert.throws(() => formatSrt([{ start: 2, end: 1, text: 'bad' }], 'job/bad'), /segment 1/);
 });
 
-test('atomic SRT failure removes temporary file', async () => {
+test('atomic artifact writes use same-directory UTF-8 temporary files', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-atomic-'));
+  for (const name of ['transcript.txt', 'transcript.srt', 'summary.md', 'metadata.json', 'transcript.json']) {
+    const target = path.join(dir, name); const calls = [];
+    await writeFileAtomic(target, '中文\r\ntext', {
+      writeFile: async (file, data, encoding) => { calls.push(['write', file, data, encoding]); await fs.writeFile(file, data, encoding); },
+      rename: async (from, to) => { calls.push(['rename', from, to]); await fs.rename(from, to); },
+      unlink: async (file) => { calls.push(['unlink', file]); await fs.rm(file, { force: true }); }
+    });
+    assert.equal(await fs.readFile(target, 'utf8'), '中文\r\ntext');
+    assert.equal(path.dirname(calls[0][1]), dir); assert.notEqual(calls[0][1], target);
+    assert.match(path.basename(calls[0][1]), /^\.[^/]+-[0-9a-f-]+\.tmp$/i);
+  }
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('atomic artifact write preserves rename error and suppresses cleanup error', async () => {
   const calls = [];
-  await assert.rejects(() => writeSrtAtomic('C:/job/transcript.srt', 'bad', { writeFile: async (file) => { calls.push(file); }, rename: async () => { throw new Error('rename failed'); }, unlink: async (file) => { calls.push('unlink:' + file); } }), /rename failed/);
+  await assert.rejects(() => writeFileAtomic('C:/job/summary.md', 'bad', {
+    writeFile: async (file) => { calls.push(file); },
+    rename: async () => { throw new Error('rename failed'); },
+    unlink: async (file) => { calls.push('unlink:' + file); throw new Error('cleanup failed'); }
+  }), /rename failed/);
   assert.match(calls[1], /^unlink:/);
+});
+
+test('atomic artifact write reports temporary write failure', async () => {
+  await assert.rejects(() => writeFileAtomic('C:/job/metadata.json', 'bad', {
+    writeFile: async () => { throw new Error('write failed'); },
+    rename: async () => { throw new Error('must not rename'); },
+    unlink: async () => undefined
+  }), /write failed/);
 });
 
 test('fake subtitle pipeline adds yt-dlp limits and cleans temporary subtitles', async () => {

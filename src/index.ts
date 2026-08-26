@@ -106,11 +106,21 @@ export function formatSrt(segments: TranscriptSegment[], jobPath = 'job') {
   return cues.length ? cues.join('\r\n\r\n') + '\r\n' : '';
 }
 
-type AtomicFileOps = { writeFile: (file: string, data: string, encoding: 'utf8') => Promise<void>; rename: (from: string, to: string) => Promise<void>; unlink: (file: string) => Promise<void> };
-export async function writeSrtAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
-  const temporary = path.join(path.dirname(filePath), '.transcript.srt-' + crypto.randomUUID() + '.tmp');
-  try { await ops.writeFile(temporary, content, 'utf8'); await ops.rename(temporary, filePath); }
-  catch (error) { await ops.unlink(temporary).catch(() => undefined); throw error; }
+export type AtomicFileOps = { writeFile: (file: string, data: string, encoding: 'utf8') => Promise<void>; rename: (from: string, to: string) => Promise<void>; unlink: (file: string) => Promise<void> };
+
+export async function writeFileAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
+  const temporary = path.join(path.dirname(filePath), '.' + path.basename(filePath) + '-' + crypto.randomUUID() + '.tmp');
+  try {
+    await ops.writeFile(temporary, content, 'utf8');
+    await ops.rename(temporary, filePath);
+  } catch (error) {
+    await ops.unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function writeSrtAtomic(filePath: string, content: string, ops?: AtomicFileOps) {
+  return writeFileAtomic(filePath, content, ops);
 }
 
 type CleanupEntry = { name: string; fullPath: string; modifiedAt: number; size: number; running: boolean; deletable: boolean };
@@ -349,7 +359,7 @@ async function transcribe(audio: string, config: any, jobDir: string) {
     release();
   }
 }
-const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json';
+const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json' || /^\.(?:transcript\.json|transcript\.txt|summary\.md|transcript\.srt|metadata\.json)-[0-9a-f-]+\.tmp$/i.test(name);
 
 export async function understand(args: any, config: any) {
   validateResourceConfig(config);
@@ -358,7 +368,7 @@ export async function understand(args: any, config: any) {
   const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
   await fs.mkdir(jobDir, { recursive: true });
   const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' }; const metadataPath = path.join(jobDir, 'metadata.json');
-  await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+  await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
   const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes };
   const limits = ['--no-playlist', '--match-filter', 'duration <= ' + (config.maxDurationSeconds ?? 3600), '--max-filesize', String(config.maxFileBytes ?? 500 * 1024 * 1024)];
   try {
@@ -381,18 +391,19 @@ export async function understand(args: any, config: any) {
       const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text; srtSegments = transcript.segments;
     }
     const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md'); const srtPath = path.join(jobDir, 'transcript.srt');
-    await fs.writeFile(transcriptPath, text); await fs.writeFile(summaryPath, extractiveSummary(text, args.summaryInstruction));
-    if (srtSegments?.length) { await writeSrtAtomic(srtPath, formatSrt(srtSegments, jobDir)); metadata.srt = { generated: true, path: srtPath }; }
+    await writeFileAtomic(transcriptPath, text);
+    await writeFileAtomic(summaryPath, extractiveSummary(text, args.summaryInstruction));
+    if (srtSegments?.length) { await writeFileAtomic(srtPath, formatSrt(srtSegments, jobDir)); metadata.srt = { generated: true, path: srtPath }; }
     else { metadata.srt = { generated: false, reason: 'no valid timestamps' }; await fs.rm(srtPath, { force: true }); }
     for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'transcript.srt', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
-    metadata.status = 'completed'; await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    metadata.status = 'completed'; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     return { jobDir, method: metadata.method, transcriptPath, srtPath: metadata.srt?.generated ? srtPath : undefined, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
   } catch (error) {
     metadata.status = 'failed'; metadata.error = error instanceof Error ? error.message : String(error);
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     throw error;
   } finally {
-    for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (metadata.status === 'failed' && ['audio.wav', 'transcript.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
+    for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (metadata.status === 'failed' && ['audio.wav', 'transcript.json', 'transcript.txt', 'summary.md', 'transcript.srt'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
   }
 }
 const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string' }, method: { type: 'string', enum: ['subtitles', 'whisper'] }, transcriptPath: { type: 'string' }, srtPath: { type: 'string' }, summaryPath: { type: 'string' }, metadataPath: { type: 'string' }, transcriptSummary: { type: 'string' } }, required: ['jobDir', 'method', 'transcriptPath', 'summaryPath', 'metadataPath', 'transcriptSummary'] }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
