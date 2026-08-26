@@ -119,12 +119,22 @@ function isWindowsReplaceError(error: unknown, platform = process.platform) {
   return platform === 'win32' && (code === 'EEXIST' || code === 'EPERM' || code === 'ENOTEMPTY');
 }
 
+export function createDefaultAtomicFileOps(platform: NodeJS.Platform = process.platform): AtomicFileOps {
+  return {
+    platform,
+    writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding),
+    rename: (from, to) => fs.rename(from, to),
+    copyFile: (from, to) => fs.copyFile(from, to),
+    unlink: (file) => fs.rm(file, { force: true })
+  };
+}
+
 /**
  * Replaces through rename first. Windows has no public Node binding for the
  * strict ReplaceFileW operation; its fallback copies over the target and is
  * therefore compatibility-only, not a strict atomic replacement.
  */
-export async function writeFileAtomic(filePath: string, content: string, ops: AtomicFileOps = { writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding), rename: (from, to) => fs.rename(from, to), copyFile: (from, to) => fs.copyFile(from, to), unlink: (file) => fs.rm(file, { force: true }) }) {
+export async function writeFileAtomic(filePath: string, content: string, ops: AtomicFileOps = createDefaultAtomicFileOps()) {
   const temporary = path.join(path.dirname(filePath), '.' + path.basename(filePath) + '-' + crypto.randomUUID() + '.tmp');
   try {
     await ops.writeFile(temporary, content, 'utf8');

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, createDefaultAtomicFileOps, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
@@ -151,6 +151,18 @@ test('Windows fallback does not claim strict atomic replacement', async () => {
     rename: async () => { const error = new Error('exists'); error.code = 'EPERM'; throw error; },
     copyFile: async () => calls.push(['copy']), unlink: async () => calls.push(['unlink'])
   });
+  assert.deepEqual(calls.map((call) => call[0]), ['write', 'copy', 'unlink']);
+});
+
+test('default atomic ops factory reads process platform and enables Windows fallback', async () => {
+  assert.equal(createDefaultAtomicFileOps().platform, process.platform);
+  const calls = [];
+  const ops = createDefaultAtomicFileOps('win32');
+  ops.writeFile = async (file) => calls.push(['write', file]);
+  ops.rename = async () => { const error = new Error('exists'); error.code = 'EEXIST'; throw error; };
+  ops.copyFile = async () => calls.push(['copy']);
+  ops.unlink = async () => calls.push(['unlink']);
+  await writeFileAtomic('target', 'new', ops);
   assert.deepEqual(calls.map((call) => call[0]), ['write', 'copy', 'unlink']);
 });
 
