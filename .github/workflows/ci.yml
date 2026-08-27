@@ -26,6 +26,7 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - run: npm run build
       - run: node scripts/doctor.mjs --files-only
       - run: npm run verify:pack
       - name: Verify bootstrap and dependency files
