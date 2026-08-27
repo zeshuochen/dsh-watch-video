@@ -1,6 +1,6 @@
 - insert:
-    - id: dsh-video-understand
-      name: dsh-video-understand
+    - id: dsh-watch-video
+      name: dsh-watch-video
       config:
         outputDir: "${DSH_HOME}/video-understand/jobs"
         device: cuda

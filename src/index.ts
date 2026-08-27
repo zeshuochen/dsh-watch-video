@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
 
-export const name = 'dsh-video-understand';
+export const name = 'dsh-watch-video';
 export const inject = ['tools'];
 export const Config = Schema.object({
   outputDir: Schema.string().required(), ytDlpPath: Schema.string(), pythonPath: Schema.string(),
@@ -555,11 +555,11 @@ const output = { schema: { type: 'object', additionalProperties: false, properti
 const statusOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['running', 'completed', 'failed', 'cancelled', 'not_found'], required: true }, phase: { type: 'string', enum: ['queued', 'probing_subtitles', 'downloading_audio', 'transcribing', 'writing_artifacts', 'completed', 'failed', 'cancelled'], required: true }, createdAt: { type: 'string', required: true }, updatedAt: { type: 'string', required: true }, method: { oneOf: [{ type: 'string', enum: ['subtitles', 'whisper'] }, { type: 'null' }], required: true }, progress: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true }, message: { type: 'string', required: true }, found: { type: 'boolean', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 const listOutput = { schema: { type: 'array', items: statusOutput.schema }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 export const cancelOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['not_found', 'completed', 'failed', 'cancelled'], required: true }, cancelled: { type: 'boolean', required: true }, message: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
-export const cancelToolDefinition = { name: 'dsh_video_understand_cancel', description: 'Cancel a running video understanding job in this process.', parameters: { jobId: { type: 'string', required: true } }, output: cancelOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('cancel parameters only allow jobId'); return cancelJob(args.jobId); } };
-export const statusToolDefinition = { name: 'dsh_video_understand_status', description: 'Read one video understanding job status in this process.', parameters: { jobId: { type: 'string', required: true } }, output: statusOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('status parameters only allow jobId'); return getJobStatus(args.jobId); } };
-export const listToolDefinition = { name: 'dsh_video_understand_list', description: 'List video understanding jobs in this process.', parameters: {}, output: listOutput, execute: (args: any) => { if (Object.keys(args).length !== 0) throw new Error('list parameters must be empty'); return listJobs(); } };
+export const cancelToolDefinition = { name: 'dsh_watch_video_cancel', description: 'Cancel a running video understanding job in this process.', parameters: { jobId: { type: 'string', required: true } }, output: cancelOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('cancel parameters only allow jobId'); return cancelJob(args.jobId); } };
+export const statusToolDefinition = { name: 'dsh_watch_video_status', description: 'Read one video understanding job status in this process.', parameters: { jobId: { type: 'string', required: true } }, output: statusOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('status parameters only allow jobId'); return getJobStatus(args.jobId); } };
+export const listToolDefinition = { name: 'dsh_watch_video_list', description: 'List video understanding jobs in this process.', parameters: {}, output: listOutput, execute: (args: any) => { if (Object.keys(args).length !== 0) throw new Error('list parameters must be empty'); return listJobs(); } };
 export function apply(ctx: any, config: any) {
-  ctx.tools.register((defineTool as any)({ name: 'dsh_video_understand', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) }));
+  ctx.tools.register((defineTool as any)({ name: 'dsh_watch_video', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) }));
   ctx.tools.register((defineTool as any)(cancelToolDefinition));
   ctx.tools.register((defineTool as any)(statusToolDefinition));
   ctx.tools.register((defineTool as any)(listToolDefinition));

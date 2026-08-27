@@ -8,21 +8,21 @@ import { apply, cancelToolDefinition, cleanupArtifacts, getJobStatus, listJobs, 
 
 test('registers strict video job tool contracts', async () => {
   const cancel = cancelToolDefinition;
-  assert.equal(cancel.name, 'dsh_video_understand_cancel'); assert.deepEqual(Object.keys(cancel.parameters), ['jobId']);
+  assert.equal(cancel.name, 'dsh_watch_video_cancel'); assert.deepEqual(Object.keys(cancel.parameters), ['jobId']);
   assert.equal(cancel.parameters.jobId.required, true);
   assert.equal(cancel.output.schema.additionalProperties, false);
   assert.ok(Object.values(cancel.output.schema.properties).every((property) => property.required === true));
   assert.doesNotThrow(() => defineTool(cancel));
   assert.throws(() => cancel.execute({ jobId: '00000000-0000-4000-8000-000000000000', extra: true }), /only allow jobId/);
   const registered = []; assert.doesNotThrow(() => apply({ tools: { register: (tool) => registered.push(tool) } }, {}));
-  assert.deepEqual(registered.map((tool) => tool.name), ['dsh_video_understand', 'dsh_video_understand_cancel', 'dsh_video_understand_status', 'dsh_video_understand_list']);
-  const status = registered.find((tool) => tool.name === 'dsh_video_understand_status');
+  assert.deepEqual(registered.map((tool) => tool.name), ['dsh_watch_video', 'dsh_watch_video_cancel', 'dsh_watch_video_status', 'dsh_watch_video_list']);
+  const status = registered.find((tool) => tool.name === 'dsh_watch_video_status');
   assert.deepEqual(Object.keys(status.parameters.properties), ['jobId']);
   assert.deepEqual(status.parameters.required, ['jobId']);
   assert.equal(status.output.schema.additionalProperties, false);
   assert.deepEqual(Object.keys(status.output.schema.properties), ['jobId', 'status', 'phase', 'createdAt', 'updatedAt', 'method', 'progress', 'message', 'found']);
   await assert.rejects(() => status.execute({ jobId: 'x', extra: true }), /only allow jobId/);
-  const list = registered.find((tool) => tool.name === 'dsh_video_understand_list');
+  const list = registered.find((tool) => tool.name === 'dsh_watch_video_list');
   assert.deepEqual(Object.keys(list.parameters.properties), []);
   await assert.rejects(() => list.execute({ extra: true }), /must be empty/);
 });
