@@ -14,6 +14,7 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm run pack:check
+      - run: npm run verify:pack
       - run: python -m py_compile scripts/transcribe.py
 
   windows-runtime:
@@ -26,6 +27,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node scripts/doctor.mjs --files-only
+      - run: npm run verify:pack
       - name: Verify bootstrap and dependency files
         shell: pwsh
         run: |

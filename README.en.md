@@ -24,4 +24,12 @@ Node.js 20+, Python 3.10+, `yt-dlp`, and `ffmpeg`. Install Node and Python depen
 - `dsh_watch_video_list`
 - `dsh_watch_video_cancel`
 
+## Verification
+
+```powershell
+npm run verify:pack
+```
+
+This clean-package check runs entirely offline: it does not download a Whisper model or access real video sites.
+
 Job status and cancellation are process-local. See [README.zh.md](README.zh.md) for full configuration and platform details.

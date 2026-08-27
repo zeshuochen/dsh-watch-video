@@ -45,6 +45,7 @@ npm run doctor
 npm test
 npm run typecheck
 npm run pack:check
+npm run verify:pack
 node scripts/doctor.mjs --files-only
 ```
 

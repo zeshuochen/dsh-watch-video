@@ -41,3 +41,5 @@
 ## 验证
 
 `npm test`、`npm run typecheck`、`npm run pack:check` 均不下载模型、不请求真实站点。
+
+使用 `npm run verify:pack` 验收干净发布包：它会在临时目录中打包、解压并动态加载 tarball，不依赖源码目录或仓库 `node_modules`，不会下载 Whisper 模型，也不会访问真实视频站点。成功和失败后都会清理临时目录。
