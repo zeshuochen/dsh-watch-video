@@ -9,8 +9,8 @@ if (fs.existsSync(controlPath)) {
   fs.appendFileSync(path.join(root, 'fake-transcribe-events.log'), 'start ' + path.basename(path.dirname(output)) + '\n');
   setTimeout(() => {
     fs.appendFileSync(path.join(root, 'fake-transcribe-events.log'), 'end ' + path.basename(path.dirname(output)) + '\n');
-    fs.writeFileSync(output, JSON.stringify({ text: 'Fallback transcript.', language: 'en', segments: [] }));
+    fs.writeFileSync(output, JSON.stringify({ text: 'Fallback transcript.', language: 'en', segments: [{ start: 3599.9996, end: 3600.5004, text: 'Whisper <b>fallback</b>.\n中文' }] }));
   }, control.delayMs || 0);
 } else {
-  fs.writeFileSync(output, JSON.stringify({ text: 'Fallback transcript.', language: 'en', segments: [] }));
+  fs.writeFileSync(output, JSON.stringify({ text: 'Fallback transcript.', language: 'en', segments: [{ start: 3599.9996, end: 3600.5004, text: 'Whisper <b>fallback</b>.\n中文' }] }));
 }

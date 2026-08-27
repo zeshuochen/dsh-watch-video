@@ -3,15 +3,23 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, cancelJob, getActiveJobIds, run, terminateProcessTree, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, createDefaultAtomicFileOps, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
+const waitFor = async (predicate, timeoutMs = 1000) => { const end = Date.now() + timeoutMs; while (!predicate()) { if (Date.now() >= end) throw new Error('condition timed out'); await new Promise((resolve) => setTimeout(resolve, 5)); } };
 
 test('run terminates a timed-out process tree', async () => {
   const result = await run(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], process.cwd(), { timeoutMs: 25 });
   assert.equal(result.timedOut, true);
   assert.equal(result.ok, false);
+});
+
+test('process tree termination selects Windows taskkill and Unix process groups', () => {
+  const calls = []; const child = { pid: 42, kill: () => calls.push('child') };
+  terminateProcessTree(child, { platform: 'win32', taskkill: (pid) => calls.push('taskkill:' + pid) });
+  terminateProcessTree(child, { platform: 'linux', killGroup: (pid) => calls.push('group:' + pid) });
+  assert.deepEqual(calls, ['taskkill:42', 'group:42']);
 });
 
 test('url rejects local and reserved IP literals', () => {
@@ -40,11 +48,153 @@ test('subtitle parser handles VTT, SRT, metadata, tags, entities, and adjacent d
   assert.equal(cleanSubtitle('WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n'), '');
 });
 
+test('formats SRT timestamps across minutes, hours, rounding, multiline text, and blank cues', () => {
+  const srt = formatSrt([{ start: 59.9996, end: 60.0014, text: '<i>跨分钟</i>\r\n第二行' }, { start: 3599.9996, end: 3600.5004, text: '跨小时' }, { start: 1, end: 2, text: '   ' }], 'job/example');
+  assert.equal(srt, '1\r\n00:01:00,000 --> 00:01:00,001\r\n跨分钟\r\n第二行\r\n\r\n2\r\n01:00:00,000 --> 01:00:00,500\r\n跨小时\r\n');
+});
+
+test('parses cue settings and rejects invalid cue timestamps', () => {
+  assert.deepEqual(parseSubtitleCues('WEBVTT\n\n00:00:01.000 --> 00:00:02.000 position:10%\n<b>中文</b>'), [{ start: 1, end: 2, text: '中文' }]);
+  assert.throws(() => parseSubtitleCues('00:61:00.000 --> 00:62:00.000\ntext'), /invalid subtitle timestamp/);
+});
+
+test('accepts overlapping and adjacent cues without changing their times', () => {
+  const srt = formatSrt([{ start: 0, end: 2, text: 'first' }, { start: 1, end: 2, text: 'overlap' }, { start: 2, end: 3, text: 'adjacent' }], 'job/overlap');
+  assert.match(srt, /00:00:01,000 --> 00:00:02,000/);
+  assert.match(srt, /00:00:02,000 --> 00:00:03,000/);
+});
+
+test('rejects illegal timestamps and non-positive cue durations with job and segment', () => {
+  for (const start of [-1, NaN, Infinity]) assert.throws(() => formatSrt([{ start, end: 2, text: 'bad' }], 'job/bad'), /job\/bad, segment 1/);
+  assert.throws(() => formatSrt([{ start: 1, end: 1, text: 'bad' }], 'job/bad'), /segment 1/);
+  assert.throws(() => formatSrt([{ start: 2, end: 1, text: 'bad' }], 'job/bad'), /segment 1/);
+});
+
+test('atomic artifact writes use same-directory UTF-8 temporary files', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-atomic-'));
+  for (const name of ['transcript.txt', 'transcript.srt', 'summary.md', 'metadata.json', 'transcript.json']) {
+    const target = path.join(dir, name); const calls = [];
+    await writeFileAtomic(target, '中文\r\ntext', {
+      writeFile: async (file, data, encoding) => { calls.push(['write', file, data, encoding]); await fs.writeFile(file, data, encoding); },
+      rename: async (from, to) => { calls.push(['rename', from, to]); await fs.rename(from, to); },
+      unlink: async (file) => { calls.push(['unlink', file]); await fs.rm(file, { force: true }); }
+    });
+    assert.equal(await fs.readFile(target, 'utf8'), '中文\r\ntext');
+    assert.equal(path.dirname(calls[0][1]), dir); assert.notEqual(calls[0][1], target);
+    assert.match(path.basename(calls[0][1]), /^\.[^/]+-[0-9a-f-]+\.tmp$/i);
+  }
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('atomic artifact write preserves rename error and suppresses cleanup error', async () => {
+  const calls = [];
+  await assert.rejects(() => writeFileAtomic('C:/job/summary.md', 'bad', {
+    writeFile: async (file) => { calls.push(file); },
+    rename: async () => { throw new Error('rename failed'); },
+    unlink: async (file) => { calls.push('unlink:' + file); throw new Error('cleanup failed'); }
+  }), /rename failed/);
+  assert.match(calls[1], /^unlink:/);
+});
+
+test('atomic artifact write reports temporary write failure', async () => {
+  await assert.rejects(() => writeFileAtomic('C:/job/metadata.json', 'bad', {
+    writeFile: async () => { throw new Error('write failed'); },
+    rename: async () => { throw new Error('must not rename'); },
+    unlink: async () => undefined
+  }), /write failed/);
+});
+
+test('atomic write succeeds when target does not exist and when it already exists', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-replace-'));
+  const target = path.join(dir, 'metadata.json');
+  await writeFileAtomic(target, JSON.stringify({ status: 'running' }), { ...realAtomicOps(), platform: 'linux' });
+  await writeFileAtomic(target, JSON.stringify({ status: 'completed' }), { ...realAtomicOps(), platform: 'linux' });
+  assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).status, 'completed');
+  assert.equal((await fs.readdir(dir)).some((name) => name.endsWith('.tmp')), false);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('Windows existing-target rename fallback replaces content and cleans temp', async () => {
+  const files = new Map([['target', 'running']]); const calls = [];
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file, data) => { calls.push(['write', file]); files.set(file, data); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EEXIST'; throw error; },
+    copyFile: async (from, to) => { calls.push(['copy', from, to]); files.set(to, files.get(from)); },
+    unlink: async (file) => { calls.push(['unlink', file]); files.delete(file); }
+  };
+  await writeFileAtomic('target', 'completed', ops);
+  assert.equal(files.get('target'), 'completed');
+  assert.equal(calls.filter((call) => call[0] === 'unlink').length, 1);
+});
+
+test('replace failure preserves existing target and original error', async () => {
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file) => { if (file === 'target') throw new Error('unexpected target write'); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EEXIST'; throw error; },
+    copyFile: async () => { throw new Error('replace failed'); },
+    unlink: async () => undefined
+  };
+  await assert.rejects(() => writeFileAtomic('target', 'new', ops), /replace failed/);
+});
+
+test('Windows replace failure keeps the existing target content', async () => {
+  const files = new Map([['target', 'running']]);
+  const ops = {
+    platform: 'win32',
+    writeFile: async (file, data) => { files.set(file, data); },
+    rename: async () => { const error = new Error('target exists'); error.code = 'EPERM'; throw error; },
+    copyFile: async () => { throw new Error('replace failed'); },
+    unlink: async (file) => { files.delete(file); }
+  };
+  await assert.rejects(() => writeFileAtomic('target', 'completed', ops), /replace failed/);
+  assert.equal(files.get('target'), 'running');
+});
+
+test('Windows fallback does not claim strict atomic replacement', async () => {
+  const calls = [];
+  await writeFileAtomic('target', 'new', {
+    platform: 'win32', writeFile: async (file) => calls.push(['write', file]),
+    rename: async () => { const error = new Error('exists'); error.code = 'EPERM'; throw error; },
+    copyFile: async () => calls.push(['copy']), unlink: async () => calls.push(['unlink'])
+  });
+  assert.deepEqual(calls.map((call) => call[0]), ['write', 'copy', 'unlink']);
+});
+
+test('default atomic ops factory reads process platform and enables Windows fallback', async () => {
+  assert.equal(createDefaultAtomicFileOps().platform, process.platform);
+  const calls = [];
+  const ops = createDefaultAtomicFileOps('win32');
+  ops.writeFile = async (file) => calls.push(['write', file]);
+  ops.rename = async () => { const error = new Error('exists'); error.code = 'EEXIST'; throw error; };
+  ops.copyFile = async () => calls.push(['copy']);
+  ops.unlink = async () => calls.push(['unlink']);
+  await writeFileAtomic('target', 'new', ops);
+  assert.deepEqual(calls.map((call) => call[0]), ['write', 'copy', 'unlink']);
+});
+
+function realAtomicOps() { return {
+  writeFile: (file, data, encoding) => fs.writeFile(file, data, encoding),
+  rename: (from, to) => fs.rename(from, to),
+  unlink: (file) => fs.rm(file, { force: true })
+}; }
+
 test('fake subtitle pipeline adds yt-dlp limits and cleans temporary subtitles', async () => {
   const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-'));
   const result = await understand({ url: 'https://example.test/video', summaryInstruction: 'focus' }, base(out));
-  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['metadata.json', 'summary.md', 'transcript.txt']);
-  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).status, 'completed');
+  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['metadata.json', 'summary.md', 'transcript.srt', 'transcript.txt']);
+  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).srt.generated, true);
+  assert.match(await fs.readFile(result.srtPath, 'utf8'), /00:01:59,500 --> 02:00:00,125/);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('subtitle text without timestamps records the reason and omits SRT', async () => {
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-no-timestamps-'));
+  const result = await understand({ url: 'https://example.test/video' }, base(out, ['--no-timestamps']));
+  const metadata = JSON.parse(await fs.readFile(result.metadataPath, 'utf8'));
+  assert.deepEqual(metadata.srt, { generated: false, reason: 'no valid timestamps' });
+  assert.equal((await fs.readdir(result.jobDir)).includes('transcript.srt'), false);
   await fs.rm(out, { recursive: true, force: true });
 });
 
@@ -53,7 +203,7 @@ test('fake whisper fallback keeps audio and transcript artifacts', async () => {
   const result = await understand({ url: 'https://example.test/video' }, base(out, ['--fail-subs']));
   assert.equal(result.method, 'whisper');
   assert.equal(await fs.readFile(result.transcriptPath, 'utf8'), 'Fallback transcript.');
-  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['audio.wav', 'metadata.json', 'summary.md', 'transcript.json', 'transcript.txt']);
+  assert.deepEqual((await fs.readdir(result.jobDir)).sort(), ['audio.wav', 'metadata.json', 'summary.md', 'transcript.json', 'transcript.srt', 'transcript.txt']);
   await fs.rm(out, { recursive: true, force: true });
 });
 
@@ -63,6 +213,38 @@ test('failed task records metadata and removes partial files', async () => {
   const [job] = await fs.readdir(out); const jobDir = path.join(out, job);
   const kept = await fs.readdir(jobDir); assert.deepEqual(kept, ['metadata.json']);
   const metadata = JSON.parse(await fs.readFile(path.join(jobDir, 'metadata.json'), 'utf8')); assert.equal(metadata.status, 'failed');
+  assert.equal(getActiveJobIds().includes(job), false);
+  const cancelResult = await cancelJob(job); assert.equal(cancelResult.status, 'failed'); assert.equal(cancelResult.cancelled, false);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('cancel running fake yt-dlp records cancelled metadata and cleans artifacts', async () => {
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-cancel-download-'));
+  const task = understand({ url: 'https://example.test/video' }, { ...base(out, ['--delay-ms=500']), timeoutMs: 2000 });
+  await waitFor(() => getActiveJobIds().length === 1);
+  const jobId = getActiveJobIds()[0];
+  const [first, second] = await Promise.all([cancelJob(jobId), cancelJob(jobId)]);
+  await assert.rejects(task, /cancelled/);
+  assert.equal(first.cancelled, true); assert.equal(second.cancelled, true);
+  assert.equal(first.status, 'cancelled');
+  const jobDir = path.join(out, jobId); const metadata = JSON.parse(await fs.readFile(path.join(jobDir, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.status, 'cancelled'); assert.match(metadata.cancelReason, /user/);
+  assert.deepEqual(await fs.readdir(jobDir), ['metadata.json']);
+  assert.equal(getActiveJobIds().includes(jobId), false);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('cancel returns not found and completed jobs are not cancelled', async () => {
+  const missing = await cancelJob('00000000-0000-4000-8000-000000000000');
+  assert.deepEqual(missing, { jobId: '00000000-0000-4000-8000-000000000000', status: 'not_found', cancelled: false, message: 'job not found or no longer running' });
+  const invalid = await cancelJob('../outside'); assert.equal(invalid.status, 'not_found');
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-cancel-complete-'));
+  const result = await understand({ url: 'https://example.test/video' }, base(out));
+  const completedId = path.basename(result.jobDir);
+  const completed = await cancelJob(completedId);
+  assert.equal(completed.status, 'completed'); assert.equal(completed.cancelled, false);
+  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).status, 'completed');
+  assert.equal(getActiveJobIds().includes(completedId), false);
   await fs.rm(out, { recursive: true, force: true });
 });
 

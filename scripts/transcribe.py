@@ -34,7 +34,7 @@ except Exception as error:
     result = transcribe('cpu', 'int8')
 
 output_dir = os.path.dirname(os.path.abspath(args.output)) or '.'
-fd, temporary = tempfile.mkstemp(prefix='.transcript-', suffix='.json', dir=output_dir, text=True)
+fd, temporary = tempfile.mkstemp(prefix='.transcript.json-', suffix='.tmp', dir=output_dir, text=True)
 os.close(fd)
 try:
     with open(temporary, 'w', encoding='utf8') as output:
@@ -45,4 +45,7 @@ try:
     os.replace(temporary, args.output)
 finally:
     if os.path.exists(temporary):
-        os.unlink(temporary)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass

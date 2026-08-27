@@ -1,4 +1,4 @@
-# dsh-video-understand
+# dsh-watch-video
 
 Subtitle-first video transcription and deterministic extractive summaries for DeepSeek Harness. It uses `yt-dlp` for media access and faster-whisper `large-v3` only when subtitles are unavailable or unusable. No external LLM is called.
 
@@ -31,9 +31,21 @@ Invalid resource values fail before a job directory or external process is start
 
 ## Artifacts
 
-Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, and `summary.md`; Whisper jobs also contain `audio.wav` and `transcript.json`. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.
+Each job is stored under a UUID directory containing `metadata.json`, `transcript.txt`, `summary.md`, and, when valid timestamps exist, `transcript.srt`. `transcript.srt` is a UTF-8 SubRip subtitle file using `HH:MM:SS,mmm --> HH:MM:SS,mmm` timestamps, suitable for subtitle players and downstream editing. Whisper jobs also contain `audio.wav` and `transcript.json`. When no valid timestamps are available, no SRT file is generated and `metadata.json` records the reason. The tool returns artifact paths and a short transcript preview, never the complete transcript. Original video files are not retained.
+
+Artifact replacement writes a complete UTF-8 temporary file in the target directory and uses `rename` first. Unix-like systems provide the intended atomic replacement when the target exists. Windows may reject `rename` when the target exists; in that case the plugin uses a compatibility `copyFile` fallback and does not claim strict atomic replacement because Node does not expose the Windows `ReplaceFileW` API. If replacement fails, the existing target is not deleted by the plugin and the original error is returned.
 
 Before each new job, the plugin applies the retention policy. It skips the current job, jobs whose `metadata.json` status is `running`, directories with invalid or mismatched metadata, and top-level symbolic links. Completed or failed jobs older than `retentionDays` are removed first; if the remaining artifacts exceed `maxTotalBytes`, eligible jobs are then removed from oldest to newest until under the limit. Cleanup only removes job directories directly inside `outputDir` and never follows symbolic links, so paths outside `outputDir` are protected.
+
+## Cancelling jobs
+
+Use `dsh_watch_video_cancel` with the running job's `jobId`. Cancellation is process-local: only jobs registered in the current Node process can be cancelled, and no process handles are stored in `metadata.json`. Active yt-dlp or Whisper process trees are terminated using `taskkill.exe /PID /T /F` on Windows or the detached process group on Unix. A job waiting for a transcription slot is removed from the FIFO queue without consuming a slot. Cancelled jobs finish cleanup before the tool returns, record `status: cancelled` and a user cancellation reason, and remove partial media, transcript, summary, SRT, and temporary files. Completed and failed jobs are not terminated by later cancellation requests.
+
+## Querying jobs
+
+Use `dsh_watch_video_status` with a UUID `jobId` to read one task, or call `dsh_watch_video_list` with no parameters to list running tasks and retained terminal tasks in the current Node.js process. Status summaries contain only `jobId`, `status`, `phase`, `createdAt`, `updatedAt`, `method`, `progress`, `message`, and `found`; they never include transcripts, process handles, PIDs, credentials, or absolute paths. `progress` is `null` unless a reliable bounded value is available. Unknown or evicted jobs return `found: false` and `status: not_found`.
+
+The supported phases are `queued`, `probing_subtitles`, `downloading_audio`, `transcribing`, `writing_artifacts`, `completed`, `failed`, and `cancelled`. The process keeps the latest 1000 completed, failed, or cancelled summaries in FIFO order; active tasks are kept separately until cleanup finishes. Querying is read-only and does not start a process or touch the job directory. Call `dsh_watch_video_status` or `dsh_watch_video_list` first to find a `jobId`, then pass that ID to `dsh_watch_video_cancel`. Cancellation and completion use the existing terminal-state claim logic, so querying cannot cancel or revive a task.
 
 ## Copyright and responsible use
 
