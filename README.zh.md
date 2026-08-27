@@ -28,6 +28,12 @@
 
 使用 `dsh_video_understand_cancel` 并传入运行中任务的 `jobId`。取消能力只在当前 Node 进程内有效：只能取消当前进程注册的任务，`metadata.json` 不保存进程对象。正在运行的 yt-dlp 或 Whisper 会在 Windows 上通过 `taskkill.exe /PID /T /F` 终止进程树，在 Unix 上终止 detached 进程组；等待转录槽位的任务会从 FIFO 队列移除且不占用槽位。取消工具会等待清理完成，metadata 最终记录 `status: cancelled` 和用户取消原因，并清除媒体、transcript、summary、SRT 半成品及临时文件。已完成或已失败任务不会被后续取消请求再次终止。
 
+## 查询任务
+
+使用 `dsh_video_understand_status` 并传入 UUID `jobId` 查询单个任务，或无参数调用 `dsh_video_understand_list`，列出当前 Node.js 进程中的运行任务和保留的终态任务。状态摘要只包含 `jobId`、`status`、`phase`、`createdAt`、`updatedAt`、`method`、`progress`、`message`、`found`，不会包含 transcript、进程句柄、PID、凭证或绝对路径。除非存在可靠的有限进度值，否则 `progress` 为 `null`。不存在或已淘汰的任务返回 `found: false` 与 `status: not_found`。
+
+支持的阶段为 `queued`、`probing_subtitles`、`downloading_audio`、`transcribing`、`writing_artifacts`、`completed`、`failed` 和 `cancelled`。当前进程按 FIFO 保留最近 1000 个 completed、failed、cancelled 终态摘要；运行任务在清理完成前单独保留。查询只读，不会启动进程或修改任务目录。先用 status/list 找到 `jobId`，再把它传给 `dsh_video_understand_cancel`；查询不会取消或重新激活任务，取消与完成仍遵守现有终态认领逻辑。
+
 ## 版权与责任边界
 
 你必须自行确认对内容的访问、下载、转录和保存拥有许可，并遵守网站条款、访问控制、版权、隐私及适用法律。本插件不授予转载或再分发权，不应被用于绕过登录、付费墙、DRM 或平台限制。

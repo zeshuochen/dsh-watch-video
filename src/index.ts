@@ -414,15 +414,38 @@ async function transcribe(audio: string, config: any, jobDir: string, signal?: A
 }
 const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json' || /^\.(?:transcript\.json|transcript\.txt|summary\.md|transcript\.srt|metadata\.json)-[0-9a-f-]+\.tmp$/i.test(name);
 
+export type JobStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'not_found';
+export type JobPhase = 'queued' | 'probing_subtitles' | 'downloading_audio' | 'transcribing' | 'writing_artifacts' | 'completed' | 'failed' | 'cancelled';
+export type JobStatusSummary = {
+  jobId: string; status: JobStatus; phase: JobPhase; createdAt: string; updatedAt: string;
+  method: 'subtitles' | 'whisper' | null; progress: number | null; message: string; found: true;
+};
+type ActiveJob = { controller: AbortController; phase: 'running' | 'cancelling' | 'completing' | 'failing' | FinalJobPhase; done: Promise<void>; finish: () => void; summary: JobStatusSummary };
 type FinalJobPhase = 'completed' | 'failed' | 'cancelled';
-type JobPhase = 'running' | 'cancelling' | 'completing' | 'failing' | FinalJobPhase;
-type ActiveJob = { controller: AbortController; phase: JobPhase; done: Promise<void>; finish: () => void };
 const activeJobs = new Map<string, ActiveJob>();
-const finishedJobs = new Map<string, FinalJobPhase>();
+const finishedJobs = new Map<string, JobStatusSummary>();
 const MAX_FINISHED_JOBS = 1000;
 const JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function getActiveJobIds() { return [...activeJobs.keys()]; }
+
+function snapshot(summary: JobStatusSummary): JobStatusSummary { return { ...summary }; }
+function notFoundStatus(jobId: string) {
+  return { jobId, status: 'not_found' as JobStatus, phase: 'failed' as JobPhase, createdAt: '', updatedAt: '', method: null, progress: null, message: 'job not found', found: false };
+}
+export function getJobStatus(jobId: string): JobStatusSummary | (ReturnType<typeof notFoundStatus>) {
+  if (!JOB_ID_PATTERN.test(jobId)) return notFoundStatus(jobId);
+  const active = activeJobs.get(jobId); if (active) return snapshot(active.summary);
+  const finished = finishedJobs.get(jobId); return finished ? snapshot(finished) : notFoundStatus(jobId);
+}
+export function listJobs() { return [...activeJobs.values()].map((job) => snapshot(job.summary)).concat([...finishedJobs.values()].map(snapshot)); }
+function updateSummary(job: ActiveJob, patch: Partial<Pick<JobStatusSummary, 'phase' | 'status' | 'method' | 'progress' | 'message'>>) {
+  Object.assign(job.summary, patch, { updatedAt: new Date().toISOString() });
+}
+function rememberFinished(jobId: string, summary: JobStatusSummary) {
+  finishedJobs.set(jobId, snapshot(summary));
+  while (finishedJobs.size > MAX_FINISHED_JOBS) finishedJobs.delete(finishedJobs.keys().next().value!);
+}
 
 function claimCompletion(job: ActiveJob) {
   if (job.phase !== 'running') return false;
@@ -434,14 +457,14 @@ export async function cancelJob(jobId: string) {
   if (!JOB_ID_PATTERN.test(jobId)) return { jobId, status: 'not_found', cancelled: false, message: 'job not found' };
   const job = activeJobs.get(jobId);
   if (!job) {
-    const status = finishedJobs.get(jobId);
-    if (status) return { jobId, status, cancelled: status === 'cancelled', message: 'job is already ' + status };
+    const summary = finishedJobs.get(jobId);
+    if (summary) return { jobId, status: summary.status, cancelled: summary.status === 'cancelled', message: 'job is already ' + summary.status };
     return { jobId, status: 'not_found', cancelled: false, message: 'job not found or no longer running' };
   }
   if (job.phase === 'running') { job.phase = 'cancelling'; job.controller.abort(); }
   if (job.phase === 'cancelling' || job.phase === 'completing' || job.phase === 'failing') {
     await job.done;
-    const status = finishedJobs.get(jobId) ?? (job.phase === 'cancelling' ? 'cancelled' : job.phase === 'completing' ? 'completed' : 'failed');
+    const status = finishedJobs.get(jobId)?.status ?? (job.phase === 'cancelling' ? 'cancelled' : job.phase === 'completing' ? 'completed' : 'failed');
     return { jobId, status, cancelled: status === 'cancelled', message: status === 'cancelled' ? 'job cancelled by user' : 'job is already ' + status };
   }
   return { jobId, status: job.phase, cancelled: false, message: 'job is already ' + job.phase };
@@ -455,8 +478,10 @@ export async function understand(args: any, config: any) {
   const controller = new AbortController();
   let finishJob!: () => void;
   const done = new Promise<void>((resolve) => { finishJob = resolve; });
-  const job: ActiveJob = { controller, phase: 'running', done, finish: finishJob };
-  const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' };
+  const now = new Date().toISOString();
+  const summary: JobStatusSummary = { jobId, status: 'running', phase: 'queued', createdAt: now, updatedAt: now, method: 'subtitles', progress: null, message: 'Job queued', found: true };
+  const job: ActiveJob = { controller, phase: 'running', done, finish: finishJob, summary };
+  const metadata: any = { url: url.href, jobId, status: 'running', phase: 'queued', method: 'subtitles', createdAt: now, updatedAt: now };
   const metadataPath = path.join(jobDir, 'metadata.json');
   const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes, signal: controller.signal };
   const limits = ['--no-playlist', '--match-filter', 'duration <= ' + (config.maxDurationSeconds ?? 3600), '--max-filesize', String(config.maxFileBytes ?? 500 * 1024 * 1024)];
@@ -464,6 +489,7 @@ export async function understand(args: any, config: any) {
   try {
     await fs.mkdir(jobDir, { recursive: true });
     await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    updateSummary(job, { phase: 'probing_subtitles', message: 'Probing subtitles' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     throwIfCancelled(controller.signal);
     const subtitleArgs = [...limits, '--skip-download', '--write-subs', '--write-auto-subs', '--sub-format', 'vtt', '-o', path.join(jobDir, 'source.%(ext)s'), url.href];
     let result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...subtitleArgs], jobDir, runOptions); let text = '';
@@ -477,17 +503,19 @@ export async function understand(args: any, config: any) {
       srtSegments = parseSubtitleCues(subtitleSource);
     }
     if (!result.ok || !text) {
-      metadata.method = 'whisper'; const audio = path.join(jobDir, 'audio.wav');
+      updateSummary(job, { phase: 'downloading_audio', method: 'whisper', message: 'Downloading audio' }); metadata.method = 'whisper'; metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2)); const audio = path.join(jobDir, 'audio.wav');
       result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...limits, '-x', '--audio-format', 'wav', '-o', audio, url.href], jobDir, runOptions);
       throwIfCancelled(controller.signal);
       if (!result.ok) throw new Error(result.stderr || 'yt-dlp audio extraction failed');
       const audioSize = (await fs.stat(audio)).size; if (audioSize > (config.maxFileBytes ?? 500 * 1024 * 1024)) throw new Error('audio output exceeded maxFileBytes');
+      updateSummary(job, { phase: 'transcribing', message: 'Transcribing audio', progress: null }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
       result = await transcribe(audio, config, jobDir, controller.signal);
       throwIfCancelled(controller.signal);
       if (!result.ok) throw new Error(result.stderr || 'transcription failed');
       const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text; srtSegments = transcript.segments;
     }
     throwIfCancelled(controller.signal);
+    updateSummary(job, { phase: 'writing_artifacts', message: 'Writing artifacts' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md'); const srtPath = path.join(jobDir, 'transcript.srt');
     await writeFileAtomic(transcriptPath, text);
     throwIfCancelled(controller.signal);
@@ -499,16 +527,15 @@ export async function understand(args: any, config: any) {
     for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'transcript.srt', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
     throwIfCancelled(controller.signal);
     if (!claimCompletion(job)) throw new JobCancelledError();
-    metadata.status = 'completed'; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
-    job.phase = 'completed';
+    job.phase = 'completed'; updateSummary(job, { status: 'completed', phase: 'completed', message: 'Job completed', progress: 100 }); metadata.status = 'completed'; metadata.phase = 'completed'; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     return { jobDir, method: metadata.method, transcriptPath, srtPath: metadata.srt?.generated ? srtPath : undefined, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
   } catch (error) {
     if (job.phase === 'cancelling') {
-      job.phase = 'cancelled'; metadata.status = 'cancelled'; metadata.cancelReason = 'job cancelled by user'; delete metadata.error;
+      job.phase = 'cancelled'; updateSummary(job, { status: 'cancelled', phase: 'cancelled', message: 'Job cancelled' }); metadata.status = 'cancelled'; metadata.phase = 'cancelled'; metadata.updatedAt = job.summary.updatedAt; metadata.cancelReason = 'job cancelled by user'; delete metadata.error;
       await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
       throw error instanceof JobCancelledError ? error : new JobCancelledError();
     }
-    job.phase = 'failing'; metadata.status = 'failed'; metadata.error = error instanceof Error ? error.message : String(error);
+    job.phase = 'failing'; updateSummary(job, { status: 'failed', phase: 'failed', message: 'Job failed' }); metadata.status = 'failed'; metadata.phase = 'failed'; metadata.updatedAt = job.summary.updatedAt; metadata.error = error instanceof Error ? error.message : String(error);
     await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
     job.phase = 'failed';
     throw error;
@@ -518,17 +545,22 @@ export async function understand(args: any, config: any) {
       for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (removeArtifacts && ['audio.wav', 'transcript.json', 'transcript.txt', 'summary.md', 'transcript.srt'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true }).catch(() => undefined);
     } finally {
       const finalPhase: FinalJobPhase = job.phase === 'completed' ? 'completed' : job.phase === 'cancelled' || job.phase === 'cancelling' ? 'cancelled' : 'failed';
-      finishedJobs.set(jobId, finalPhase);
-      if (finishedJobs.size > MAX_FINISHED_JOBS) finishedJobs.delete(finishedJobs.keys().next().value!);
+      rememberFinished(jobId, job.summary);
       activeJobs.delete(jobId);
       job.finish();
     }
   }
 }
 const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string', required: true }, method: { type: 'string', enum: ['subtitles', 'whisper'], required: true }, transcriptPath: { type: 'string', required: true }, srtPath: { type: 'string' }, summaryPath: { type: 'string', required: true }, metadataPath: { type: 'string', required: true }, transcriptSummary: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+const statusOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['running', 'completed', 'failed', 'cancelled', 'not_found'], required: true }, phase: { type: 'string', enum: ['queued', 'probing_subtitles', 'downloading_audio', 'transcribing', 'writing_artifacts', 'completed', 'failed', 'cancelled'], required: true }, createdAt: { type: 'string', required: true }, updatedAt: { type: 'string', required: true }, method: { oneOf: [{ type: 'string', enum: ['subtitles', 'whisper'] }, { type: 'null' }], required: true }, progress: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true }, message: { type: 'string', required: true }, found: { type: 'boolean', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+const listOutput = { schema: { type: 'array', items: statusOutput.schema }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 export const cancelOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['not_found', 'completed', 'failed', 'cancelled'], required: true }, cancelled: { type: 'boolean', required: true }, message: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 export const cancelToolDefinition = { name: 'dsh_video_understand_cancel', description: 'Cancel a running video understanding job in this process.', parameters: { jobId: { type: 'string', required: true } }, output: cancelOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('cancel parameters only allow jobId'); return cancelJob(args.jobId); } };
+export const statusToolDefinition = { name: 'dsh_video_understand_status', description: 'Read one video understanding job status in this process.', parameters: { jobId: { type: 'string', required: true } }, output: statusOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('status parameters only allow jobId'); return getJobStatus(args.jobId); } };
+export const listToolDefinition = { name: 'dsh_video_understand_list', description: 'List video understanding jobs in this process.', parameters: {}, output: listOutput, execute: (args: any) => { if (Object.keys(args).length !== 0) throw new Error('list parameters must be empty'); return listJobs(); } };
 export function apply(ctx: any, config: any) {
   ctx.tools.register((defineTool as any)({ name: 'dsh_video_understand', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) }));
   ctx.tools.register((defineTool as any)(cancelToolDefinition));
+  ctx.tools.register((defineTool as any)(statusToolDefinition));
+  ctx.tools.register((defineTool as any)(listToolDefinition));
 }

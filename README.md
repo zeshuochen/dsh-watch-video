@@ -41,6 +41,12 @@ Before each new job, the plugin applies the retention policy. It skips the curre
 
 Use `dsh_video_understand_cancel` with the running job's `jobId`. Cancellation is process-local: only jobs registered in the current Node process can be cancelled, and no process handles are stored in `metadata.json`. Active yt-dlp or Whisper process trees are terminated using `taskkill.exe /PID /T /F` on Windows or the detached process group on Unix. A job waiting for a transcription slot is removed from the FIFO queue without consuming a slot. Cancelled jobs finish cleanup before the tool returns, record `status: cancelled` and a user cancellation reason, and remove partial media, transcript, summary, SRT, and temporary files. Completed and failed jobs are not terminated by later cancellation requests.
 
+## Querying jobs
+
+Use `dsh_video_understand_status` with a UUID `jobId` to read one task, or call `dsh_video_understand_list` with no parameters to list running tasks and retained terminal tasks in the current Node.js process. Status summaries contain only `jobId`, `status`, `phase`, `createdAt`, `updatedAt`, `method`, `progress`, `message`, and `found`; they never include transcripts, process handles, PIDs, credentials, or absolute paths. `progress` is `null` unless a reliable bounded value is available. Unknown or evicted jobs return `found: false` and `status: not_found`.
+
+The supported phases are `queued`, `probing_subtitles`, `downloading_audio`, `transcribing`, `writing_artifacts`, `completed`, `failed`, and `cancelled`. The process keeps the latest 1000 completed, failed, or cancelled summaries in FIFO order; active tasks are kept separately until cleanup finishes. Querying is read-only and does not start a process or touch the job directory. Call `dsh_video_understand_status` or `dsh_video_understand_list` first to find a `jobId`, then pass that ID to `dsh_video_understand_cancel`. Cancellation and completion use the existing terminal-state claim logic, so querying cannot cancel or revive a task.
+
 ## Copyright and responsible use
 
 You are responsible for permission to access, download, transcribe, and retain material. Respect site terms, access controls, copyright, privacy, and applicable law. This plugin grants no redistribution rights and must not be used to bypass authentication, paywalls, DRM, or platform restrictions.
