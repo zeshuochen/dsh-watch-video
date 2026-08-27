@@ -190,7 +190,7 @@ export async function cleanupArtifacts(outputDir: string, options: { retentionDa
     const stat = await fs.stat(fullPath);
     const size = await directorySize(fullPath);
     total += size;
-    entries.push({ name: item.name, fullPath, modifiedAt: stat.mtimeMs, size, running: metadata.status === 'running', deletable: metadata.status !== 'running' && item.name !== options.currentJobId });
+    entries.push({ name: item.name, fullPath, modifiedAt: stat.mtimeMs, size, running: metadata.status === 'running' || metadata.status === 'cancelling', deletable: !['running', 'cancelling'].includes(metadata.status) && item.name !== options.currentJobId });
   }
   entries.sort((a, b) => a.modifiedAt - b.modifiedAt || a.name.localeCompare(b.name));
   const removed: string[] = [];
@@ -266,15 +266,25 @@ export function validateUrl(value: string) {
   return url;
 }
 
-type RunResult = { ok: boolean; stdout: string; stderr: string; timedOut?: boolean; outputLimitExceeded?: boolean };
+type RunResult = { ok: boolean; stdout: string; stderr: string; timedOut?: boolean; outputLimitExceeded?: boolean; cancelled?: boolean };
 
-function terminateProcessTree(child: ReturnType<typeof spawn>) {
+export class JobCancelledError extends Error {
+  constructor() { super('job cancelled by user'); this.name = 'JobCancelledError'; }
+}
+
+function throwIfCancelled(signal?: AbortSignal) { if (signal?.aborted) throw new JobCancelledError(); }
+
+export type TerminationOps = { platform?: NodeJS.Platform; taskkill?: (pid: number) => void; killGroup?: (pid: number) => void; killChild?: () => void };
+export function terminateProcessTree(child: ReturnType<typeof spawn>, ops: TerminationOps = {}) {
   if (child.pid === undefined) return;
-  if (process.platform === 'win32') {
-    execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => undefined);
+  const platform = ops.platform ?? process.platform;
+  if (platform === 'win32') {
+    if (ops.taskkill) ops.taskkill(child.pid);
+    else execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, (error) => { if (error) child.kill('SIGKILL'); });
     return;
   }
-  try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+  try { if (ops.killGroup) ops.killGroup(child.pid); else process.kill(-child.pid, 'SIGKILL'); }
+  catch { if (ops.killChild) ops.killChild(); else child.kill('SIGKILL'); }
 }
 
 export function resolvePythonPath(pluginRoot = fileURLToPath(new URL('..', import.meta.url))) {
@@ -284,13 +294,16 @@ export function resolvePythonPath(pluginRoot = fileURLToPath(new URL('..', impor
   return candidates.find((candidate) => existsSync(candidate)) || 'python';
 }
 
-export function run(file: string, args: string[], cwd: string, options: { timeoutMs?: number; outputLimitBytes?: number } = {}) {
+export function run(file: string, args: string[], cwd: string, options: { timeoutMs?: number; outputLimitBytes?: number; signal?: AbortSignal } = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const outputLimitBytes = options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT;
   return new Promise<RunResult>((resolve) => {
-    let settled = false, stdout = '', stderr = '', stdoutBytes = 0, stderrBytes = 0, timedOut = false, outputLimitExceeded = false;
+    let settled = false, stdout = '', stderr = '', stdoutBytes = 0, stderrBytes = 0, timedOut = false, outputLimitExceeded = false, cancelled = false;
+    if (options.signal?.aborted) { resolve({ ok: false, stdout, stderr: 'job cancelled by user', cancelled: true }); return; }
     const child = spawn(file, args, { cwd, shell: false, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
-    const finish = (result: RunResult) => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
+    const onAbort = () => { cancelled = true; terminateProcessTree(child); };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    const finish = (result: RunResult) => { if (!settled) { settled = true; clearTimeout(timer); options.signal?.removeEventListener('abort', onAbort); resolve(result); } };
     const append = (kind: 'stdout' | 'stderr', chunk: Buffer) => {
       const text = chunk.toString('utf8');
       if (kind === 'stdout') { stdoutBytes += chunk.byteLength; stdout += text; } else { stderrBytes += chunk.byteLength; stderr += text; }
@@ -298,7 +311,7 @@ export function run(file: string, args: string[], cwd: string, options: { timeou
     };
     child.stdout.on('data', (chunk: Buffer) => append('stdout', chunk)); child.stderr.on('data', (chunk: Buffer) => append('stderr', chunk));
     child.on('error', (error) => finish({ ok: false, stdout, stderr: stderr || error.message, timedOut, outputLimitExceeded }));
-    child.on('close', (code) => finish({ ok: code === 0 && !timedOut && !outputLimitExceeded, stdout, stderr: timedOut ? (stderr || 'process timed out') : outputLimitExceeded ? (stderr || 'process output exceeded limit') : stderr, timedOut, outputLimitExceeded }));
+    child.on('close', (code) => finish({ ok: code === 0 && !timedOut && !outputLimitExceeded && !cancelled, stdout, stderr: cancelled ? 'job cancelled by user' : timedOut ? (stderr || 'process timed out') : outputLimitExceeded ? (stderr || 'process output exceeded limit') : stderr, timedOut, outputLimitExceeded, cancelled }));
     const timer = setTimeout(() => { timedOut = true; terminateProcessTree(child); }, timeoutMs);
   });
 }
@@ -338,7 +351,7 @@ export function selectSubtitle(files: SubtitleFile[], requested?: string) {
     return a.name.localeCompare(b.name);
   })[0];
 }
-type SemaphoreWaiter = { resolve: (release: () => void) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout; settled: boolean };
+type SemaphoreWaiter = { resolve: (release: () => void) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout; signal?: AbortSignal; onAbort?: () => void; settled: boolean };
 
 export class FifoSemaphore {
   private available: number;
@@ -347,16 +360,23 @@ export class FifoSemaphore {
     if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 4) throw new Error('invalid semaphore capacity');
     this.available = capacity;
   }
-  acquire(timeoutMs: number) {
+  acquire(timeoutMs: number, signal?: AbortSignal) {
     return new Promise<() => void>((resolve, reject) => {
-      const waiter: SemaphoreWaiter = { resolve, reject, settled: false };
-      waiter.timer = setTimeout(() => {
+      const waiter: SemaphoreWaiter = { resolve, reject, settled: false, signal };
+      const rejectWaiter = (error: Error) => {
         if (waiter.settled) return;
         waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        if (waiter.onAbort) signal?.removeEventListener('abort', waiter.onAbort);
         const index = this.queue.indexOf(waiter);
         if (index >= 0) this.queue.splice(index, 1);
-        reject(new Error('transcription queue wait timed out'));
-      }, timeoutMs);
+        reject(error);
+        this.drain();
+      };
+      waiter.onAbort = () => rejectWaiter(new JobCancelledError());
+      waiter.timer = setTimeout(() => rejectWaiter(new Error('transcription queue wait timed out')), timeoutMs);
+      if (signal?.aborted) { rejectWaiter(new JobCancelledError()); return; }
+      signal?.addEventListener('abort', waiter.onAbort, { once: true });
       this.queue.push(waiter);
       this.drain();
     });
@@ -367,6 +387,7 @@ export class FifoSemaphore {
       if (waiter.settled) continue;
       waiter.settled = true;
       if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort);
       this.available--;
       let released = false;
       waiter.resolve(() => { if (!released) { released = true; this.available++; this.drain(); } });
@@ -382,30 +403,71 @@ function getTranscriptionSemaphore(config: any) {
   return semaphore;
 }
 
-async function transcribe(audio: string, config: any, jobDir: string) {
-  const release = await getTranscriptionSemaphore(config).acquire(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+async function transcribe(audio: string, config: any, jobDir: string, signal?: AbortSignal) {
+  const release = await getTranscriptionSemaphore(config).acquire(config.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal);
   try {
     const transcriptPath = path.join(jobDir, 'transcript.json'); const device = config.device || 'cuda';
-    return await run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes });
+    return await run(config.pythonPath || resolvePythonPath(), [...(config.pythonPrefixArgs || []), config.transcribeScript || defaultTranscribeScript, '--audio', audio, '--output', transcriptPath, '--device', device, '--compute-type', device === 'cpu' ? 'int8' : (config.computeType || 'int8_float16')], jobDir, { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes, signal });
   } finally {
     release();
   }
 }
 const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json' || /^\.(?:transcript\.json|transcript\.txt|summary\.md|transcript\.srt|metadata\.json)-[0-9a-f-]+\.tmp$/i.test(name);
 
+type FinalJobPhase = 'completed' | 'failed' | 'cancelled';
+type JobPhase = 'running' | 'cancelling' | 'completing' | 'failing' | FinalJobPhase;
+type ActiveJob = { controller: AbortController; phase: JobPhase; done: Promise<void>; finish: () => void };
+const activeJobs = new Map<string, ActiveJob>();
+const finishedJobs = new Map<string, FinalJobPhase>();
+const MAX_FINISHED_JOBS = 1000;
+const JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function getActiveJobIds() { return [...activeJobs.keys()]; }
+
+function claimCompletion(job: ActiveJob) {
+  if (job.phase !== 'running') return false;
+  job.phase = 'completing';
+  return true;
+}
+
+export async function cancelJob(jobId: string) {
+  if (!JOB_ID_PATTERN.test(jobId)) return { jobId, status: 'not_found', cancelled: false, message: 'job not found' };
+  const job = activeJobs.get(jobId);
+  if (!job) {
+    const status = finishedJobs.get(jobId);
+    if (status) return { jobId, status, cancelled: status === 'cancelled', message: 'job is already ' + status };
+    return { jobId, status: 'not_found', cancelled: false, message: 'job not found or no longer running' };
+  }
+  if (job.phase === 'running') { job.phase = 'cancelling'; job.controller.abort(); }
+  if (job.phase === 'cancelling' || job.phase === 'completing' || job.phase === 'failing') {
+    await job.done;
+    const status = finishedJobs.get(jobId) ?? (job.phase === 'cancelling' ? 'cancelled' : job.phase === 'completing' ? 'completed' : 'failed');
+    return { jobId, status, cancelled: status === 'cancelled', message: status === 'cancelled' ? 'job cancelled by user' : 'job is already ' + status };
+  }
+  return { jobId, status: job.phase, cancelled: false, message: 'job is already ' + job.phase };
+}
+
 export async function understand(args: any, config: any) {
   validateResourceConfig(config);
   const url = validateUrl(args.url);
   await cleanupArtifacts(config.outputDir, { retentionDays: config.retentionDays, maxTotalBytes: config.maxTotalBytes });
   const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
-  await fs.mkdir(jobDir, { recursive: true });
-  const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' }; const metadataPath = path.join(jobDir, 'metadata.json');
-  await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
-  const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes };
+  const controller = new AbortController();
+  let finishJob!: () => void;
+  const done = new Promise<void>((resolve) => { finishJob = resolve; });
+  const job: ActiveJob = { controller, phase: 'running', done, finish: finishJob };
+  const metadata: any = { url: url.href, jobId, status: 'running', method: 'subtitles' };
+  const metadataPath = path.join(jobDir, 'metadata.json');
+  const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes, signal: controller.signal };
   const limits = ['--no-playlist', '--match-filter', 'duration <= ' + (config.maxDurationSeconds ?? 3600), '--max-filesize', String(config.maxFileBytes ?? 500 * 1024 * 1024)];
+  activeJobs.set(jobId, job);
   try {
+    await fs.mkdir(jobDir, { recursive: true });
+    await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    throwIfCancelled(controller.signal);
     const subtitleArgs = [...limits, '--skip-download', '--write-subs', '--write-auto-subs', '--sub-format', 'vtt', '-o', path.join(jobDir, 'source.%(ext)s'), url.href];
     let result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...subtitleArgs], jobDir, runOptions); let text = '';
+    throwIfCancelled(controller.signal);
     const subtitleNames = (await fs.readdir(jobDir)).filter((n) => /\.(?:vtt|srt)$/i.test(n));
     const subtitle = selectSubtitle(subtitleNames.map((name) => ({ name, manual: !/\.auto\./i.test(name), language: name.match(/\.([A-Za-z]{2,}(?:-[A-Za-z0-9]+)?)\.(?:vtt|srt)$/i)?.[1] })), config.language);
     let srtSegments: SubtitleCue[] | undefined;
@@ -417,26 +479,56 @@ export async function understand(args: any, config: any) {
     if (!result.ok || !text) {
       metadata.method = 'whisper'; const audio = path.join(jobDir, 'audio.wav');
       result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...limits, '-x', '--audio-format', 'wav', '-o', audio, url.href], jobDir, runOptions);
+      throwIfCancelled(controller.signal);
       if (!result.ok) throw new Error(result.stderr || 'yt-dlp audio extraction failed');
       const audioSize = (await fs.stat(audio)).size; if (audioSize > (config.maxFileBytes ?? 500 * 1024 * 1024)) throw new Error('audio output exceeded maxFileBytes');
-      result = await transcribe(audio, config, jobDir); if (!result.ok) throw new Error(result.stderr || 'transcription failed');
+      result = await transcribe(audio, config, jobDir, controller.signal);
+      throwIfCancelled(controller.signal);
+      if (!result.ok) throw new Error(result.stderr || 'transcription failed');
       const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text; srtSegments = transcript.segments;
     }
+    throwIfCancelled(controller.signal);
     const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md'); const srtPath = path.join(jobDir, 'transcript.srt');
     await writeFileAtomic(transcriptPath, text);
+    throwIfCancelled(controller.signal);
     await writeFileAtomic(summaryPath, extractiveSummary(text, args.summaryInstruction));
+    throwIfCancelled(controller.signal);
     if (srtSegments?.length) { await writeFileAtomic(srtPath, formatSrt(srtSegments, jobDir)); metadata.srt = { generated: true, path: srtPath }; }
     else { metadata.srt = { generated: false, reason: 'no valid timestamps' }; await fs.rm(srtPath, { force: true }); }
+    throwIfCancelled(controller.signal);
     for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'transcript.srt', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
+    throwIfCancelled(controller.signal);
+    if (!claimCompletion(job)) throw new JobCancelledError();
     metadata.status = 'completed'; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    job.phase = 'completed';
     return { jobDir, method: metadata.method, transcriptPath, srtPath: metadata.srt?.generated ? srtPath : undefined, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
   } catch (error) {
-    metadata.status = 'failed'; metadata.error = error instanceof Error ? error.message : String(error);
+    if (job.phase === 'cancelling') {
+      job.phase = 'cancelled'; metadata.status = 'cancelled'; metadata.cancelReason = 'job cancelled by user'; delete metadata.error;
+      await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+      throw error instanceof JobCancelledError ? error : new JobCancelledError();
+    }
+    job.phase = 'failing'; metadata.status = 'failed'; metadata.error = error instanceof Error ? error.message : String(error);
     await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    job.phase = 'failed';
     throw error;
   } finally {
-    for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (metadata.status === 'failed' && ['audio.wav', 'transcript.json', 'transcript.txt', 'summary.md', 'transcript.srt'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
+    try {
+      const removeArtifacts = metadata.status === 'failed' || metadata.status === 'cancelled';
+      for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (removeArtifacts && ['audio.wav', 'transcript.json', 'transcript.txt', 'summary.md', 'transcript.srt'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true }).catch(() => undefined);
+    } finally {
+      const finalPhase: FinalJobPhase = job.phase === 'completed' ? 'completed' : job.phase === 'cancelled' || job.phase === 'cancelling' ? 'cancelled' : 'failed';
+      finishedJobs.set(jobId, finalPhase);
+      if (finishedJobs.size > MAX_FINISHED_JOBS) finishedJobs.delete(finishedJobs.keys().next().value!);
+      activeJobs.delete(jobId);
+      job.finish();
+    }
   }
 }
-const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string' }, method: { type: 'string', enum: ['subtitles', 'whisper'] }, transcriptPath: { type: 'string' }, srtPath: { type: 'string' }, summaryPath: { type: 'string' }, metadataPath: { type: 'string' }, transcriptSummary: { type: 'string' } }, required: ['jobDir', 'method', 'transcriptPath', 'summaryPath', 'metadataPath', 'transcriptSummary'] }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
-export function apply(ctx: any, config: any) { ctx.tools.register((defineTool as any)({ name: 'dsh_video_understand', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) })); }
+const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string', required: true }, method: { type: 'string', enum: ['subtitles', 'whisper'], required: true }, transcriptPath: { type: 'string', required: true }, srtPath: { type: 'string' }, summaryPath: { type: 'string', required: true }, metadataPath: { type: 'string', required: true }, transcriptSummary: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+export const cancelOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['not_found', 'completed', 'failed', 'cancelled'], required: true }, cancelled: { type: 'boolean', required: true }, message: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+export const cancelToolDefinition = { name: 'dsh_video_understand_cancel', description: 'Cancel a running video understanding job in this process.', parameters: { jobId: { type: 'string', required: true } }, output: cancelOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('cancel parameters only allow jobId'); return cancelJob(args.jobId); } };
+export function apply(ctx: any, config: any) {
+  ctx.tools.register((defineTool as any)({ name: 'dsh_video_understand', description: 'Transcribe and summarize a video, preferring available subtitles.', parameters: { url: { type: 'string', required: true }, summaryInstruction: { type: 'string' } }, output, execute: (args: any) => understand(args, config) }));
+  ctx.tools.register((defineTool as any)(cancelToolDefinition));
+}

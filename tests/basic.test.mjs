@@ -3,15 +3,23 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { validateUrl, extractiveSummary, understand, run, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, createDefaultAtomicFileOps, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
+import { validateUrl, extractiveSummary, understand, cancelJob, getActiveJobIds, run, terminateProcessTree, cleanSubtitle, selectSubtitle, formatSrt, parseSubtitleCues, createDefaultAtomicFileOps, writeFileAtomic, writeSrtAtomic } from '../dist/index.js';
 
 const fake = path.resolve('tests/fake-ytdlp.mjs');
 const base = (outputDir, extra = []) => ({ outputDir, ytDlpPath: process.execPath, ytDlpPrefixArgs: [fake, ...extra], pythonPath: process.execPath, transcribeScript: path.resolve('tests/fake-transcribe.mjs'), device: 'cpu', maxDurationSeconds: 90, maxFileBytes: 100, maxOutputBytes: 1024 });
+const waitFor = async (predicate, timeoutMs = 1000) => { const end = Date.now() + timeoutMs; while (!predicate()) { if (Date.now() >= end) throw new Error('condition timed out'); await new Promise((resolve) => setTimeout(resolve, 5)); } };
 
 test('run terminates a timed-out process tree', async () => {
   const result = await run(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], process.cwd(), { timeoutMs: 25 });
   assert.equal(result.timedOut, true);
   assert.equal(result.ok, false);
+});
+
+test('process tree termination selects Windows taskkill and Unix process groups', () => {
+  const calls = []; const child = { pid: 42, kill: () => calls.push('child') };
+  terminateProcessTree(child, { platform: 'win32', taskkill: (pid) => calls.push('taskkill:' + pid) });
+  terminateProcessTree(child, { platform: 'linux', killGroup: (pid) => calls.push('group:' + pid) });
+  assert.deepEqual(calls, ['taskkill:42', 'group:42']);
 });
 
 test('url rejects local and reserved IP literals', () => {
@@ -205,6 +213,38 @@ test('failed task records metadata and removes partial files', async () => {
   const [job] = await fs.readdir(out); const jobDir = path.join(out, job);
   const kept = await fs.readdir(jobDir); assert.deepEqual(kept, ['metadata.json']);
   const metadata = JSON.parse(await fs.readFile(path.join(jobDir, 'metadata.json'), 'utf8')); assert.equal(metadata.status, 'failed');
+  assert.equal(getActiveJobIds().includes(job), false);
+  const cancelResult = await cancelJob(job); assert.equal(cancelResult.status, 'failed'); assert.equal(cancelResult.cancelled, false);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('cancel running fake yt-dlp records cancelled metadata and cleans artifacts', async () => {
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-cancel-download-'));
+  const task = understand({ url: 'https://example.test/video' }, { ...base(out, ['--delay-ms=500']), timeoutMs: 2000 });
+  await waitFor(() => getActiveJobIds().length === 1);
+  const jobId = getActiveJobIds()[0];
+  const [first, second] = await Promise.all([cancelJob(jobId), cancelJob(jobId)]);
+  await assert.rejects(task, /cancelled/);
+  assert.equal(first.cancelled, true); assert.equal(second.cancelled, true);
+  assert.equal(first.status, 'cancelled');
+  const jobDir = path.join(out, jobId); const metadata = JSON.parse(await fs.readFile(path.join(jobDir, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.status, 'cancelled'); assert.match(metadata.cancelReason, /user/);
+  assert.deepEqual(await fs.readdir(jobDir), ['metadata.json']);
+  assert.equal(getActiveJobIds().includes(jobId), false);
+  await fs.rm(out, { recursive: true, force: true });
+});
+
+test('cancel returns not found and completed jobs are not cancelled', async () => {
+  const missing = await cancelJob('00000000-0000-4000-8000-000000000000');
+  assert.deepEqual(missing, { jobId: '00000000-0000-4000-8000-000000000000', status: 'not_found', cancelled: false, message: 'job not found or no longer running' });
+  const invalid = await cancelJob('../outside'); assert.equal(invalid.status, 'not_found');
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-cancel-complete-'));
+  const result = await understand({ url: 'https://example.test/video' }, base(out));
+  const completedId = path.basename(result.jobDir);
+  const completed = await cancelJob(completedId);
+  assert.equal(completed.status, 'completed'); assert.equal(completed.cancelled, false);
+  assert.equal(JSON.parse(await fs.readFile(result.metadataPath, 'utf8')).status, 'completed');
+  assert.equal(getActiveJobIds().includes(completedId), false);
   await fs.rm(out, { recursive: true, force: true });
 });
 

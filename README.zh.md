@@ -24,6 +24,10 @@
 
 每次新任务开始前都会执行保留策略。清理会跳过当前任务、`metadata.json` 状态为 `running` 的任务、metadata 缺失或 jobId 不匹配的目录，以及 outputDir 直接子项中的符号链接。先删除超过 `retentionDays` 的已完成/失败任务；如果剩余产物总大小超过 `maxTotalBytes`，再按任务目录修改时间从旧到新删除可清理任务，直到低于上限。清理只处理 `outputDir` 直接下的任务目录，不跟随符号链接，也不会删除 outputDir 外部目标。
 
+## 取消任务
+
+使用 `dsh_video_understand_cancel` 并传入运行中任务的 `jobId`。取消能力只在当前 Node 进程内有效：只能取消当前进程注册的任务，`metadata.json` 不保存进程对象。正在运行的 yt-dlp 或 Whisper 会在 Windows 上通过 `taskkill.exe /PID /T /F` 终止进程树，在 Unix 上终止 detached 进程组；等待转录槽位的任务会从 FIFO 队列移除且不占用槽位。取消工具会等待清理完成，metadata 最终记录 `status: cancelled` 和用户取消原因，并清除媒体、transcript、summary、SRT 半成品及临时文件。已完成或已失败任务不会被后续取消请求再次终止。
+
 ## 版权与责任边界
 
 你必须自行确认对内容的访问、下载、转录和保存拥有许可，并遵守网站条款、访问控制、版权、隐私及适用法律。本插件不授予转载或再分发权，不应被用于绕过登录、付费墙、DRM 或平台限制。

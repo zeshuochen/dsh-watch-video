@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 const a = process.argv.slice(2);
+const delayMs = Number(a.find((arg) => arg.startsWith('--delay-ms='))?.slice(11) || 0);
+if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
 fs.writeFileSync('yt-args.json', JSON.stringify(a));
 if (!a.includes('--no-playlist') || !a.includes('--match-filter') || !a.includes('--max-filesize')) process.exit(2);
 const oi = a.indexOf('-o');

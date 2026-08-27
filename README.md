@@ -37,6 +37,10 @@ Artifact replacement writes a complete UTF-8 temporary file in the target direct
 
 Before each new job, the plugin applies the retention policy. It skips the current job, jobs whose `metadata.json` status is `running`, directories with invalid or mismatched metadata, and top-level symbolic links. Completed or failed jobs older than `retentionDays` are removed first; if the remaining artifacts exceed `maxTotalBytes`, eligible jobs are then removed from oldest to newest until under the limit. Cleanup only removes job directories directly inside `outputDir` and never follows symbolic links, so paths outside `outputDir` are protected.
 
+## Cancelling jobs
+
+Use `dsh_video_understand_cancel` with the running job's `jobId`. Cancellation is process-local: only jobs registered in the current Node process can be cancelled, and no process handles are stored in `metadata.json`. Active yt-dlp or Whisper process trees are terminated using `taskkill.exe /PID /T /F` on Windows or the detached process group on Unix. A job waiting for a transcription slot is removed from the FIFO queue without consuming a slot. Cancelled jobs finish cleanup before the tool returns, record `status: cancelled` and a user cancellation reason, and remove partial media, transcript, summary, SRT, and temporary files. Completed and failed jobs are not terminated by later cancellation requests.
+
 ## Copyright and responsible use
 
 You are responsible for permission to access, download, transcribe, and retain material. Respect site terms, access controls, copyright, privacy, and applicable law. This plugin grants no redistribution rights and must not be used to bypass authentication, paywalls, DRM, or platform restrictions.

@@ -3,7 +3,20 @@ import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { cleanupArtifacts, readTranscript, understand, validateResourceConfig, validateTranscript } from '../dist/index.js';
+import { defineTool } from '@deepseek-ai/dsh-tools';
+import { apply, cancelToolDefinition, cleanupArtifacts, readTranscript, understand, validateResourceConfig, validateTranscript } from '../dist/index.js';
+
+test('registers a strict structured cancellation tool contract', () => {
+  const cancel = cancelToolDefinition;
+  assert.equal(cancel.name, 'dsh_video_understand_cancel'); assert.deepEqual(Object.keys(cancel.parameters), ['jobId']);
+  assert.equal(cancel.parameters.jobId.required, true);
+  assert.equal(cancel.output.schema.additionalProperties, false);
+  assert.ok(Object.values(cancel.output.schema.properties).every((property) => property.required === true));
+  assert.doesNotThrow(() => defineTool(cancel));
+  assert.throws(() => cancel.execute({ jobId: '00000000-0000-4000-8000-000000000000', extra: true }), /only allow jobId/);
+  const registered = []; assert.doesNotThrow(() => apply({ tools: { register: (tool) => registered.push(tool) } }, {}));
+  assert.deepEqual(registered.map((tool) => tool.name), ['dsh_video_understand', 'dsh_video_understand_cancel']);
+});
 
 test('rejects invalid resource configuration before starting a job', () => {
   for (const key of ['timeoutMs', 'outputLimitBytes', 'maxDurationSeconds', 'maxFileBytes', 'maxOutputBytes', 'retentionDays', 'maxTotalBytes']) {
@@ -37,13 +50,14 @@ test('cleans TTL and capacity oldest-first while protecting running, current, an
   const oldest = await makeJob('oldest', 'completed', 80_000, 6);
   const newest = await makeJob('newest', 'completed', 40_000, 6);
   const running = await makeJob('running', 'running', 5 * 86400000, 20);
+  const cancelling = await makeJob('cancelling', 'cancelling', 5 * 86400000, 20);
   await writeFile(path.join(outside, 'sentinel.txt'), 'safe');
   await symlink(outside, path.join(root, 'linked-job'), 'junction');
   const result = await cleanupArtifacts(root, { retentionDays: 2, maxTotalBytes: 40, currentJobId: 'newest' });
   assert.deepEqual(result.removed, ['expired', 'oldest']);
   await assert.rejects(() => access(expired));
   await assert.rejects(() => access(oldest));
-  await access(newest); await access(running); await access(path.join(outside, 'sentinel.txt'));
+  await access(newest); await access(running); await access(cancelling); await access(path.join(outside, 'sentinel.txt'));
   await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true });
 });
 
