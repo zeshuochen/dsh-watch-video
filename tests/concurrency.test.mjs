@@ -30,6 +30,7 @@ test('heartbeat updates during a job and stops after completion', async () => {
     const options = { ...config(out, 1), heartbeatIntervalMs: 1000 };
     const { promise, jobId } = await startTracked(out, options);
     const metadataPath = path.join(out, jobId, 'metadata.json');
+    await waitFor(() => fs.access(metadataPath).then(() => true, () => false));
     const initial = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
     assert.match(initial.instanceId, /^[0-9a-f-]{36}$/i);
     assert.equal(initial.jobCreatedAt, initial.createdAt);

@@ -14,6 +14,8 @@
 - 只保留转录所需音频与派生产物，不保留原视频。
 - DSH 重启后会按 `staleJobAfterMs` 将过期的 running 任务恢复为 `interrupted`，并清理不完整产物。默认阈值为 6 小时，异常心跳会保守跳过。
 
+子进程输出按流独立进行有界保留：`stdout` 保留前缀，`stderr` 保留末尾；限制按 UTF-8 字节计算，并持续 drain 两个流。超时、取消或输出超限会终止整个进程树，并返回有限的诊断信息。`maxOutputBytes` 优先于旧配置名 `outputLimitBytes`。
+
 ## 安装依赖
 
 需要 Node.js 20+、Python 3.10+、`yt-dlp` 和 `ffmpeg`。在项目目录运行：

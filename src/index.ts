@@ -317,7 +317,7 @@ export function validateUrl(value: string) {
   return url;
 }
 
-type RunResult = { ok: boolean; stdout: string; stderr: string; timedOut?: boolean; outputLimitExceeded?: boolean; cancelled?: boolean };
+type RunResult = { ok: boolean; stdout: string; stderr: string; stdoutBytes?: number; stderrBytes?: number; stdoutStrategy?: 'prefix'; stderrStrategy?: 'tail'; timedOut?: boolean; outputLimitExceeded?: boolean; cancelled?: boolean; terminationReason?: 'timeout' | 'outputLimitExceeded' | 'cancel'; errorCode?: string; diagnosticMessage?: string; exitCode?: number | null };
 
 export class JobCancelledError extends Error {
   constructor() { super('job cancelled by user'); this.name = 'JobCancelledError'; }
@@ -350,20 +350,38 @@ export function run(file: string, args: string[], cwd: string, options: { timeou
   const outputLimitBytes = options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT;
   return new Promise<RunResult>((resolve) => {
     let settled = false, stdout = '', stderr = '', stdoutBytes = 0, stderrBytes = 0, timedOut = false, outputLimitExceeded = false, cancelled = false;
-    if (options.signal?.aborted) { resolve({ ok: false, stdout, stderr: 'job cancelled by user', cancelled: true }); return; }
+    let terminationReason: 'timeout' | 'outputLimitExceeded' | 'cancel' | undefined;
+    let terminationRequested = false;
+    if (options.signal?.aborted) { resolve({ ok: false, stdout, stderr: 'job cancelled by user', cancelled: true, terminationReason: 'cancel' }); return; }
     const child = spawn(file, args, { cwd, shell: false, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
-    const onAbort = () => { cancelled = true; terminateProcessTree(child); };
+    const terminate = (reason: 'timeout' | 'outputLimitExceeded' | 'cancel') => {
+      if (terminationRequested) return;
+      terminationRequested = true;
+      terminationReason = reason;
+      terminateProcessTree(child);
+    };
+    const onAbort = () => { cancelled = true; terminate('cancel'); };
     options.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: RunResult) => { if (!settled) { settled = true; clearTimeout(timer); options.signal?.removeEventListener('abort', onAbort); resolve(result); } };
+    const boundedText = (chunk: Buffer, keepTail: boolean) => {
+      const combined = Buffer.concat([Buffer.from(keepTail ? stderr : stdout, 'utf8'), chunk]);
+      let start = keepTail ? Math.max(0, combined.byteLength - outputLimitBytes) : 0;
+      let end = keepTail ? combined.byteLength : Math.min(outputLimitBytes, combined.byteLength);
+      while (start < end) {
+        try { return new TextDecoder('utf-8', { fatal: true }).decode(combined.subarray(start, end)); }
+        catch { if (keepTail) start++; else end--; }
+      }
+      return '';
+    };
     const append = (kind: 'stdout' | 'stderr', chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      if (kind === 'stdout') { stdoutBytes += chunk.byteLength; stdout += text; } else { stderrBytes += chunk.byteLength; stderr += text; }
-      if (stdoutBytes > outputLimitBytes || stderrBytes > outputLimitBytes) { outputLimitExceeded = true; terminateProcessTree(child); }
+      if (kind === 'stdout') { stdoutBytes += chunk.byteLength; stdout = boundedText(chunk, false); }
+      else { stderrBytes += chunk.byteLength; stderr = boundedText(chunk, true); }
+      if (stdoutBytes > outputLimitBytes || stderrBytes > outputLimitBytes) { outputLimitExceeded = true; terminate('outputLimitExceeded'); }
     };
     child.stdout.on('data', (chunk: Buffer) => append('stdout', chunk)); child.stderr.on('data', (chunk: Buffer) => append('stderr', chunk));
-    child.on('error', (error) => finish({ ok: false, stdout, stderr: stderr || error.message, timedOut, outputLimitExceeded }));
-    child.on('close', (code) => finish({ ok: code === 0 && !timedOut && !outputLimitExceeded && !cancelled, stdout, stderr: cancelled ? 'job cancelled by user' : timedOut ? (stderr || 'process timed out') : outputLimitExceeded ? (stderr || 'process output exceeded limit') : stderr, timedOut, outputLimitExceeded, cancelled }));
-    const timer = setTimeout(() => { timedOut = true; terminateProcessTree(child); }, timeoutMs);
+    child.on('error', (error) => finish({ ok: false, stdout, stderr: stderr || error.message, stdoutBytes, stderrBytes, stdoutStrategy: 'prefix', stderrStrategy: 'tail', timedOut, outputLimitExceeded, cancelled, terminationReason, errorCode: (error as NodeJS.ErrnoException).code, diagnosticMessage: error.message }));
+    child.on('close', (code) => finish({ ok: code === 0 && !timedOut && !outputLimitExceeded && !cancelled, stdout, stderr: cancelled ? 'job cancelled by user' : timedOut ? (stderr || 'process timed out') : outputLimitExceeded ? (stderr || 'process output exceeded limit') : stderr, stdoutBytes, stderrBytes, stdoutStrategy: 'prefix', stderrStrategy: 'tail', timedOut, outputLimitExceeded, cancelled, terminationReason, diagnosticMessage: terminationReason === 'outputLimitExceeded' ? 'process output exceeded limit' : terminationReason ? 'process ' + terminationReason + ' exceeded the configured boundary' : undefined, exitCode: code }));
+    const timer = setTimeout(() => { timedOut = true; terminate('timeout'); }, timeoutMs);
   });
 }
 
@@ -546,6 +564,7 @@ export async function understand(args: any, config: any) {
     return write;
   };
   let heartbeatTimer: NodeJS.Timeout | undefined;
+  let heartbeatStopped = false;
   const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes, signal: controller.signal };
   const limits = ['--no-playlist', '--match-filter', 'duration <= ' + (config.maxDurationSeconds ?? 3600), '--max-filesize', String(config.maxFileBytes ?? 500 * 1024 * 1024)];
   activeJobs.set(jobId, job);
@@ -553,6 +572,7 @@ export async function understand(args: any, config: any) {
     await fs.mkdir(jobDir, { recursive: true });
     await persistMetadata();
     heartbeatTimer = setInterval(() => {
+      if (heartbeatStopped) return;
       metadata.heartbeatAt = new Date().toISOString();
       metadata.updatedAt = metadata.heartbeatAt;
       void persistMetadata().catch((error) => console.warn('dsh-watch-video heartbeat update failed:', error instanceof Error ? error.message : String(error)));
@@ -608,6 +628,7 @@ export async function understand(args: any, config: any) {
     job.phase = 'failed';
     throw error;
   } finally {
+    heartbeatStopped = true;
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     await metadataWriteChain.catch(() => undefined);
     try {

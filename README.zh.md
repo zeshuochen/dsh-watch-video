@@ -44,4 +44,6 @@
 
 DSH 重启后，插件会依据 `staleJobAfterMs` 扫描合法任务目录，将心跳明确过期的 `running`/`cancelling` 任务标记为 `interrupted`，写入 `stale_running_job` 原因并清理不完整产物。默认阈值为 6 小时；心跳缺失、非法或未来时间会保守跳过，不会尝试恢复跨进程的实际运行状态。
 
+子进程输出按流分别进行有界保留：`stdout` 保留前缀，`stderr` 保留末尾；限制以 UTF-8 字节为准，同时继续 drain 两个流。超时、用户取消或输出超限会清理整个进程树，并返回有界诊断信息。`maxOutputBytes` 优先于旧配置名 `outputLimitBytes`。
+
 使用 `npm run verify:pack` 验收干净发布包：它会在临时目录中打包、解压并动态加载 tarball，不依赖源码目录或仓库 `node_modules`，不会下载 Whisper 模型，也不会访问真实视频站点。成功和失败后都会清理临时目录。

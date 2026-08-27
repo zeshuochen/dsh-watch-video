@@ -1,3 +1,5 @@
 node_modules/
 dist/
 .venv/
+scripts/__pycache__/
+*.tgz

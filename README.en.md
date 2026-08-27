@@ -14,6 +14,8 @@ Subtitle-first video transcription for DeepSeek Harness. It uses subtitles when 
 - No external LLM calls and no original-video retention.
 - Stale running jobs become `interrupted` after restart; the default `staleJobAfterMs` is 6 hours, and ambiguous heartbeats are skipped conservatively.
 
+Child-process output is bounded independently per stream: `stdout` keeps a prefix and `stderr` keeps a tail, with limits measured in UTF-8 bytes while both streams continue draining. Timeout, cancellation, and output-limit termination clean the entire process tree and return bounded diagnostics. `maxOutputBytes` takes precedence over the legacy `outputLimitBytes` name.
+
 ## Requirements
 
 Node.js 20+, Python 3.10+, `yt-dlp`, and `ffmpeg`. Install Node and Python dependencies, run `scripts/bootstrap.ps1`, then `npm run doctor`. The first real Whisper fallback downloads the `large-v3` model.
