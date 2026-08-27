@@ -14,7 +14,7 @@
 
 ## 配置
 
-配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。Whisper 回退使用 host 进程内 FIFO 队列，由 `maxConcurrentTranscriptions` 控制；字幕任务不进入该队列，排队等待会使用任务超时并及时失败释放。产物保留配置 `retentionDays` 默认 30 天（1–3650），`maxTotalBytes` 默认 10 GiB（1–100 GiB）；两者都必须是安全正整数。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。`maxConcurrentTranscriptions` 默认 1，范围 1–4。
+配置输出目录，并可选设置 `ytDlpPath`、`pythonPath`、`transcribeScript`、前置参数、`device`、`computeType`、`timeoutMs`（默认 15 分钟）和 `outputLimitBytes`（每个输出流默认 1 MiB）。`staleJobAfterMs` 默认 6 小时，范围为 5 分钟至 7 天，仅据明确过期的 heartbeat 恢复遗留任务；`heartbeatIntervalMs` 默认 30 秒，范围为 1 秒至 1 小时。Whisper 回退使用 host 进程内 FIFO 队列，由 `maxConcurrentTranscriptions` 控制；字幕任务不进入该队列，排队等待会使用任务超时并及时失败释放。产物保留配置 `retentionDays` 默认 30 天（1–3650），`maxTotalBytes` 默认 10 GiB（1–100 GiB）；两者都必须是安全正整数。`run()` 保持 `shell: false`；超时或输出超限时会终止整个进程树：Windows 使用受控的 `taskkill.exe /PID /T /F`，Unix 使用 detached 进程组发送 `SIGKILL`，并保留子进程回退。URL 必须是 HTTP(S)，不得含凭据或控制字符。`maxConcurrentTranscriptions` 默认 1，范围 1–4。
 
 ## 产物
 
@@ -41,5 +41,7 @@
 ## 验证
 
 `npm test`、`npm run typecheck`、`npm run pack:check` 均不下载模型、不请求真实站点。
+
+DSH 重启后，插件会依据 `staleJobAfterMs` 扫描合法任务目录，将心跳明确过期的 `running`/`cancelling` 任务标记为 `interrupted`，写入 `stale_running_job` 原因并清理不完整产物。默认阈值为 6 小时；心跳缺失、非法或未来时间会保守跳过，不会尝试恢复跨进程的实际运行状态。
 
 使用 `npm run verify:pack` 验收干净发布包：它会在临时目录中打包、解压并动态加载 tarball，不依赖源码目录或仓库 `node_modules`，不会下载 Whisper 模型，也不会访问真实视频站点。成功和失败后都会清理临时目录。

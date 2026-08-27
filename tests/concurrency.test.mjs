@@ -23,6 +23,27 @@ for (const limit of [1, 3]) test('fake runner respects transcription concurrency
   await fs.rm(out, { recursive: true, force: true });
 });
 
+test('heartbeat updates during a job and stops after completion', async () => {
+  const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-heartbeat-'));
+  try {
+    await fs.writeFile(path.join(out, 'fake-transcribe-control.json'), JSON.stringify({ delayMs: 1500 }));
+    const options = { ...config(out, 1), heartbeatIntervalMs: 1000 };
+    const { promise, jobId } = await startTracked(out, options);
+    const metadataPath = path.join(out, jobId, 'metadata.json');
+    const initial = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    assert.match(initial.instanceId, /^[0-9a-f-]{36}$/i);
+    assert.equal(initial.jobCreatedAt, initial.createdAt);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const active = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    assert.notEqual(active.heartbeatAt, initial.heartbeatAt);
+    await promise;
+    const completed = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const stopped = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    assert.equal(stopped.heartbeatAt, completed.heartbeatAt);
+  } finally { await fs.rm(out, { recursive: true, force: true }); }
+});
+
 test('subtitle jobs do not consume transcription slots', async () => {
   const out = await fs.mkdtemp(path.join(os.tmpdir(), 'dvu-subtitle-slot-'));
   await fs.writeFile(path.join(out, 'fake-transcribe-control.json'), JSON.stringify({ delayMs: 150 }));

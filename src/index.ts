@@ -17,12 +17,16 @@ export const Config = Schema.object({
   maxDurationSeconds: Schema.number().default(60 * 60), maxFileBytes: Schema.number().default(500 * 1024 * 1024),
   maxOutputBytes: Schema.number().default(1024 * 1024),
   retentionDays: Schema.number().default(30), maxTotalBytes: Schema.number().default(10 * 1024 * 1024 * 1024),
-  maxConcurrentTranscriptions: Schema.number().default(1),
+  maxConcurrentTranscriptions: Schema.number().default(1), staleJobAfterMs: Schema.number().default(6 * 60 * 60 * 1000), heartbeatIntervalMs: Schema.number().default(30 * 1000),
 });
 
 const defaultTranscribeScript = fileURLToPath(new URL('../scripts/transcribe.py', import.meta.url));
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_OUTPUT_LIMIT = 1024 * 1024;
+export const JOB_INSTANCE_ID = crypto.randomUUID();
+export const JOB_INSTANCE_STARTED_AT = new Date().toISOString();
+export const DEFAULT_STALE_JOB_AFTER_MS = 6 * 60 * 60 * 1000;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 
 const RESOURCE_LIMITS = {
   timeoutMs: [1, 24 * 60 * 60 * 1000],
@@ -33,6 +37,8 @@ const RESOURCE_LIMITS = {
   retentionDays: [1, 3650],
   maxTotalBytes: [1, 100 * 1024 * 1024 * 1024],
   maxConcurrentTranscriptions: [1, 4],
+  staleJobAfterMs: [5 * 60 * 1000, 7 * 24 * 60 * 60 * 1000],
+  heartbeatIntervalMs: [1000, 60 * 60 * 1000],
 } as const;
 
 export function validateResourceConfig(config: Record<string, unknown>) {
@@ -201,6 +207,51 @@ export async function cleanupArtifacts(outputDir: string, options: { retentionDa
     removed.push(entry.name);
   }
   return { removed, totalBytes: total };
+}
+
+
+export async function recoverInterruptedJobs(outputDir: string, options: { staleJobAfterMs?: number; now?: number } = {}): Promise<RecoveryResult> {
+  const staleJobAfterMs = options.staleJobAfterMs ?? DEFAULT_STALE_JOB_AFTER_MS;
+  validateResourceConfig({ staleJobAfterMs });
+  const root = path.resolve(outputDir);
+  const now = options.now ?? Date.now();
+  const result: RecoveryResult = { recovered: [], skipped: [], cleanupErrors: [] };
+  const items = await fs.readdir(root, { withFileTypes: true }).catch(() => [] as import('node:fs').Dirent[]);
+  for (const item of items) {
+    if (!item.isDirectory() || item.isSymbolicLink() || !JOB_ID_PATTERN.test(item.name)) continue;
+    const jobDir = path.resolve(root, item.name);
+    if (path.dirname(jobDir) !== root) continue;
+    const metadataPath = path.join(jobDir, 'metadata.json');
+    let metadata: any;
+    try { metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')); }
+    catch { result.skipped.push({ jobId: item.name, reason: 'invalid_metadata' }); continue; }
+    if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata) || metadata.jobId !== item.name || typeof metadata.status !== 'string' || !JOB_ID_PATTERN.test(metadata.jobId)) { result.skipped.push({ jobId: item.name, reason: 'invalid_metadata_structure' }); continue; }
+    if (metadata.status !== 'running' && metadata.status !== 'cancelling') continue;
+    if (activeJobs.has(item.name)) { result.skipped.push({ jobId: item.name, reason: 'active_in_current_process' }); continue; }
+    const heartbeat = Date.parse(metadata.heartbeatAt);
+    if (!metadata.heartbeatAt || !Number.isFinite(heartbeat)) { result.skipped.push({ jobId: item.name, reason: 'missing_or_invalid_heartbeat' }); continue; }
+    if (heartbeat > now) { result.skipped.push({ jobId: item.name, reason: 'heartbeat_in_future' }); continue; }
+    if (now - heartbeat <= staleJobAfterMs) { result.skipped.push({ jobId: item.name, reason: 'heartbeat_is_fresh' }); continue; }
+    const cleanupErrors: string[] = [];
+    try {
+      for (const child of await fs.readdir(jobDir, { withFileTypes: true })) {
+        if (child.name === 'metadata.json' || child.isSymbolicLink()) continue;
+        const childPath = path.resolve(jobDir, child.name);
+        if (path.dirname(childPath) !== jobDir) continue;
+        try { await fs.rm(childPath, { recursive: child.isDirectory(), force: true }); }
+        catch (error) { cleanupErrors.push(child.name + ': ' + (error instanceof Error ? error.message : String(error))); }
+      }
+      metadata.status = 'interrupted'; metadata.phase = 'interrupted'; metadata.reason = RECOVERY_REASON; metadata.message = RECOVERY_MESSAGE; metadata.updatedAt = new Date(now).toISOString();
+      if (cleanupErrors.length) metadata.cleanupError = cleanupErrors.join('; ');
+      await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+      const summary: JobStatusSummary = { jobId: item.name, status: 'interrupted', phase: 'interrupted', createdAt: metadata.jobCreatedAt || metadata.createdAt || metadata.updatedAt, updatedAt: metadata.updatedAt, method: metadata.method || null, progress: null, message: RECOVERY_MESSAGE, found: true };
+      rememberFinished(item.name, summary); result.recovered.push(item.name);
+      if (cleanupErrors.length) result.cleanupErrors.push({ jobId: item.name, error: metadata.cleanupError });
+    } catch (error) {
+      result.cleanupErrors.push({ jobId: item.name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return result;
 }
 
 export function validateTranscript(value: unknown): Transcript {
@@ -414,18 +465,22 @@ async function transcribe(audio: string, config: any, jobDir: string, signal?: A
 }
 const tempNames = (name: string) => name.startsWith('source.') || name === 'yt-args.json' || /^\.(?:transcript\.json|transcript\.txt|summary\.md|transcript\.srt|metadata\.json)-[0-9a-f-]+\.tmp$/i.test(name);
 
-export type JobStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'not_found';
-export type JobPhase = 'queued' | 'probing_subtitles' | 'downloading_audio' | 'transcribing' | 'writing_artifacts' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'not_found';
+export type JobPhase = 'queued' | 'probing_subtitles' | 'downloading_audio' | 'transcribing' | 'writing_artifacts' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export type JobStatusSummary = {
   jobId: string; status: JobStatus; phase: JobPhase; createdAt: string; updatedAt: string;
   method: 'subtitles' | 'whisper' | null; progress: number | null; message: string; found: true;
 };
 type ActiveJob = { controller: AbortController; phase: 'running' | 'cancelling' | 'completing' | 'failing' | FinalJobPhase; done: Promise<void>; finish: () => void; summary: JobStatusSummary };
-type FinalJobPhase = 'completed' | 'failed' | 'cancelled';
+type FinalJobPhase = 'completed' | 'failed' | 'cancelled' | 'interrupted';
 const activeJobs = new Map<string, ActiveJob>();
 const finishedJobs = new Map<string, JobStatusSummary>();
 const MAX_FINISHED_JOBS = 1000;
+const RECOVERY_REASON = 'stale_running_job';
+const RECOVERY_MESSAGE = 'Previous process stopped before the job completed';
 const JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export type RecoveryResult = { recovered: string[]; skipped: Array<{ jobId: string; reason: string }>; cleanupErrors: Array<{ jobId: string; error: string }> };
 
 export function getActiveJobIds() { return [...activeJobs.keys()]; }
 
@@ -473,6 +528,7 @@ export async function cancelJob(jobId: string) {
 export async function understand(args: any, config: any) {
   validateResourceConfig(config);
   const url = validateUrl(args.url);
+  await recoverInterruptedJobs(config.outputDir, { staleJobAfterMs: config.staleJobAfterMs });
   await cleanupArtifacts(config.outputDir, { retentionDays: config.retentionDays, maxTotalBytes: config.maxTotalBytes });
   const jobId = crypto.randomUUID(); const jobDir = path.join(config.outputDir, jobId);
   const controller = new AbortController();
@@ -481,15 +537,27 @@ export async function understand(args: any, config: any) {
   const now = new Date().toISOString();
   const summary: JobStatusSummary = { jobId, status: 'running', phase: 'queued', createdAt: now, updatedAt: now, method: 'subtitles', progress: null, message: 'Job queued', found: true };
   const job: ActiveJob = { controller, phase: 'running', done, finish: finishJob, summary };
-  const metadata: any = { url: url.href, jobId, status: 'running', phase: 'queued', method: 'subtitles', createdAt: now, updatedAt: now };
+  const metadata: any = { url: url.href, jobId, status: 'running', phase: 'queued', method: 'subtitles', createdAt: now, updatedAt: now, instanceId: JOB_INSTANCE_ID, startedAt: JOB_INSTANCE_STARTED_AT, jobCreatedAt: now, heartbeatAt: now };
   const metadataPath = path.join(jobDir, 'metadata.json');
+  let metadataWriteChain = Promise.resolve();
+  const persistMetadata = () => {
+    const write = metadataWriteChain.then(() => writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2)));
+    metadataWriteChain = write.catch(() => undefined);
+    return write;
+  };
+  let heartbeatTimer: NodeJS.Timeout | undefined;
   const runOptions = { timeoutMs: config.timeoutMs, outputLimitBytes: config.maxOutputBytes ?? config.outputLimitBytes, signal: controller.signal };
   const limits = ['--no-playlist', '--match-filter', 'duration <= ' + (config.maxDurationSeconds ?? 3600), '--max-filesize', String(config.maxFileBytes ?? 500 * 1024 * 1024)];
   activeJobs.set(jobId, job);
   try {
     await fs.mkdir(jobDir, { recursive: true });
-    await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
-    updateSummary(job, { phase: 'probing_subtitles', message: 'Probing subtitles' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    await persistMetadata();
+    heartbeatTimer = setInterval(() => {
+      metadata.heartbeatAt = new Date().toISOString();
+      metadata.updatedAt = metadata.heartbeatAt;
+      void persistMetadata().catch((error) => console.warn('dsh-watch-video heartbeat update failed:', error instanceof Error ? error.message : String(error)));
+    }, config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS);
+    updateSummary(job, { phase: 'probing_subtitles', message: 'Probing subtitles' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await persistMetadata();
     throwIfCancelled(controller.signal);
     const subtitleArgs = [...limits, '--skip-download', '--write-subs', '--write-auto-subs', '--sub-format', 'vtt', '-o', path.join(jobDir, 'source.%(ext)s'), url.href];
     let result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...subtitleArgs], jobDir, runOptions); let text = '';
@@ -503,19 +571,19 @@ export async function understand(args: any, config: any) {
       srtSegments = parseSubtitleCues(subtitleSource);
     }
     if (!result.ok || !text) {
-      updateSummary(job, { phase: 'downloading_audio', method: 'whisper', message: 'Downloading audio' }); metadata.method = 'whisper'; metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2)); const audio = path.join(jobDir, 'audio.wav');
+      updateSummary(job, { phase: 'downloading_audio', method: 'whisper', message: 'Downloading audio' }); metadata.method = 'whisper'; metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await persistMetadata(); const audio = path.join(jobDir, 'audio.wav');
       result = await run(config.ytDlpPath || 'yt-dlp', [...(config.ytDlpPrefixArgs || []), ...limits, '-x', '--audio-format', 'wav', '-o', audio, url.href], jobDir, runOptions);
       throwIfCancelled(controller.signal);
       if (!result.ok) throw new Error(result.stderr || 'yt-dlp audio extraction failed');
       const audioSize = (await fs.stat(audio)).size; if (audioSize > (config.maxFileBytes ?? 500 * 1024 * 1024)) throw new Error('audio output exceeded maxFileBytes');
-      updateSummary(job, { phase: 'transcribing', message: 'Transcribing audio', progress: null }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+      updateSummary(job, { phase: 'transcribing', message: 'Transcribing audio', progress: null }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await persistMetadata();
       result = await transcribe(audio, config, jobDir, controller.signal);
       throwIfCancelled(controller.signal);
       if (!result.ok) throw new Error(result.stderr || 'transcription failed');
       const transcript = await readTranscript(path.join(jobDir, 'transcript.json')); text = transcript.text; srtSegments = transcript.segments;
     }
     throwIfCancelled(controller.signal);
-    updateSummary(job, { phase: 'writing_artifacts', message: 'Writing artifacts' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    updateSummary(job, { phase: 'writing_artifacts', message: 'Writing artifacts' }); metadata.phase = job.summary.phase; metadata.updatedAt = job.summary.updatedAt; await persistMetadata();
     const transcriptPath = path.join(jobDir, 'transcript.txt'); const summaryPath = path.join(jobDir, 'summary.md'); const srtPath = path.join(jobDir, 'transcript.srt');
     await writeFileAtomic(transcriptPath, text);
     throwIfCancelled(controller.signal);
@@ -527,19 +595,21 @@ export async function understand(args: any, config: any) {
     for (const item of await fs.readdir(jobDir)) if (tempNames(item) || (!['audio.wav', 'transcript.txt', 'transcript.json', 'transcript.srt', 'summary.md', 'metadata.json'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true });
     throwIfCancelled(controller.signal);
     if (!claimCompletion(job)) throw new JobCancelledError();
-    job.phase = 'completed'; updateSummary(job, { status: 'completed', phase: 'completed', message: 'Job completed', progress: 100 }); metadata.status = 'completed'; metadata.phase = 'completed'; metadata.updatedAt = job.summary.updatedAt; await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    job.phase = 'completed'; updateSummary(job, { status: 'completed', phase: 'completed', message: 'Job completed', progress: 100 }); metadata.status = 'completed'; metadata.phase = 'completed'; metadata.updatedAt = job.summary.updatedAt; await persistMetadata();
     return { jobDir, method: metadata.method, transcriptPath, srtPath: metadata.srt?.generated ? srtPath : undefined, summaryPath, metadataPath, transcriptSummary: text.slice(0, 240) };
   } catch (error) {
     if (job.phase === 'cancelling') {
       job.phase = 'cancelled'; updateSummary(job, { status: 'cancelled', phase: 'cancelled', message: 'Job cancelled' }); metadata.status = 'cancelled'; metadata.phase = 'cancelled'; metadata.updatedAt = job.summary.updatedAt; metadata.cancelReason = 'job cancelled by user'; delete metadata.error;
-      await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+      await persistMetadata();
       throw error instanceof JobCancelledError ? error : new JobCancelledError();
     }
     job.phase = 'failing'; updateSummary(job, { status: 'failed', phase: 'failed', message: 'Job failed' }); metadata.status = 'failed'; metadata.phase = 'failed'; metadata.updatedAt = job.summary.updatedAt; metadata.error = error instanceof Error ? error.message : String(error);
-    await writeFileAtomic(metadataPath, JSON.stringify(metadata, null, 2));
+    await persistMetadata();
     job.phase = 'failed';
     throw error;
   } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    await metadataWriteChain.catch(() => undefined);
     try {
       const removeArtifacts = metadata.status === 'failed' || metadata.status === 'cancelled';
       for (const item of await fs.readdir(jobDir).catch(() => [])) if (tempNames(item) || item.startsWith('source.') || (removeArtifacts && ['audio.wav', 'transcript.json', 'transcript.txt', 'summary.md', 'transcript.srt'].includes(item))) await fs.rm(path.join(jobDir, item), { recursive: true, force: true }).catch(() => undefined);
@@ -552,9 +622,9 @@ export async function understand(args: any, config: any) {
   }
 }
 const output = { schema: { type: 'object', additionalProperties: false, properties: { jobDir: { type: 'string', required: true }, method: { type: 'string', enum: ['subtitles', 'whisper'], required: true }, transcriptPath: { type: 'string', required: true }, srtPath: { type: 'string' }, summaryPath: { type: 'string', required: true }, metadataPath: { type: 'string', required: true }, transcriptSummary: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
-const statusOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['running', 'completed', 'failed', 'cancelled', 'not_found'], required: true }, phase: { type: 'string', enum: ['queued', 'probing_subtitles', 'downloading_audio', 'transcribing', 'writing_artifacts', 'completed', 'failed', 'cancelled'], required: true }, createdAt: { type: 'string', required: true }, updatedAt: { type: 'string', required: true }, method: { oneOf: [{ type: 'string', enum: ['subtitles', 'whisper'] }, { type: 'null' }], required: true }, progress: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true }, message: { type: 'string', required: true }, found: { type: 'boolean', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+const statusOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['running', 'completed', 'failed', 'cancelled', 'interrupted', 'not_found'], required: true }, phase: { type: 'string', enum: ['queued', 'probing_subtitles', 'downloading_audio', 'transcribing', 'writing_artifacts', 'completed', 'failed', 'cancelled', 'interrupted'], required: true }, createdAt: { type: 'string', required: true }, updatedAt: { type: 'string', required: true }, method: { oneOf: [{ type: 'string', enum: ['subtitles', 'whisper'] }, { type: 'null' }], required: true }, progress: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true }, message: { type: 'string', required: true }, found: { type: 'boolean', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 const listOutput = { schema: { type: 'array', items: statusOutput.schema }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
-export const cancelOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['not_found', 'completed', 'failed', 'cancelled'], required: true }, cancelled: { type: 'boolean', required: true }, message: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
+export const cancelOutput = { schema: { type: 'object', additionalProperties: false, properties: { jobId: { type: 'string', required: true }, status: { type: 'string', enum: ['not_found', 'completed', 'failed', 'cancelled', 'interrupted'], required: true }, cancelled: { type: 'boolean', required: true }, message: { type: 'string', required: true } } }, render: (_args: any, value: any) => [{ type: 'text', text: JSON.stringify(value) }] };
 export const cancelToolDefinition = { name: 'dsh_watch_video_cancel', description: 'Cancel a running video understanding job in this process.', parameters: { jobId: { type: 'string', required: true } }, output: cancelOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('cancel parameters only allow jobId'); return cancelJob(args.jobId); } };
 export const statusToolDefinition = { name: 'dsh_watch_video_status', description: 'Read one video understanding job status in this process.', parameters: { jobId: { type: 'string', required: true } }, output: statusOutput, execute: (args: any) => { if (Object.keys(args).length !== 1) throw new Error('status parameters only allow jobId'); return getJobStatus(args.jobId); } };
 export const listToolDefinition = { name: 'dsh_watch_video_list', description: 'List video understanding jobs in this process.', parameters: {}, output: listOutput, execute: (args: any) => { if (Object.keys(args).length !== 0) throw new Error('list parameters must be empty'); return listJobs(); } };

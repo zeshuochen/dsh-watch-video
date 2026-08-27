@@ -12,6 +12,7 @@ Subtitle-first video transcription for DeepSeek Harness. It uses subtitles when 
 - Cancellable jobs with status and list tools.
 - Windows, Linux, and macOS support with process-tree cleanup.
 - No external LLM calls and no original-video retention.
+- Stale running jobs become `interrupted` after restart; the default `staleJobAfterMs` is 6 hours, and ambiguous heartbeats are skipped conservatively.
 
 ## Requirements
 
